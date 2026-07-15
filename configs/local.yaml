@@ -1,0 +1,20 @@
+experiment:
+  name: local-smoke
+  seed: 7
+  output_dir: runs/local
+
+data:
+  fraction: 0.01
+  num_workers: 0
+  split: train
+
+training:
+  device: auto
+  max_epochs: 1
+  batch_size: 8
+  deterministic: true
+
+evaluation:
+  horizons: [1, 5, 10, 20]
+
+# Local results validate correctness only and must not be reported as final results.

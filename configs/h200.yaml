@@ -1,0 +1,21 @@
+experiment:
+  name: h200-full
+  seeds: [7, 19, 43, 71, 97]
+  output_dir: runs/h200
+
+data:
+  fraction: 1.0
+  num_workers: 16
+  splits: [train, validation, test]
+
+training:
+  device: cuda
+  max_epochs: null
+  batch_size: null
+  deterministic: false
+
+evaluation:
+  horizons: [1, 5, 10, 20]
+  long_horizon: null
+
+# Populate batch size, maximum epochs, and long horizon during pre-registration.

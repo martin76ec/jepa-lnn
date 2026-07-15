@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Datasets and generated experiment artifacts
+data/raw/*
+data/processed/*
+runs/*
+checkpoints/
+wandb/
+
+# Keep directory intent without committing artifacts
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!runs/.gitkeep
