@@ -29,6 +29,20 @@ uv run mypy src
 uv run pytest
 ```
 
+## Make Targets
+
+```bash
+make sync
+make download-data
+make inspect-data
+make validate-local
+make check
+```
+
+`make download-data` is resumable and writes the official PushT Lance archive
+under ignored `data/raw/`. The current targets validate the pipeline and data
+integration; train/evaluate targets will be added with their executable entry points.
+
 ## Layout
 
 ```text

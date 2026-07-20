@@ -4,6 +4,8 @@ experiment:
   output_dir: runs/local
 
 data:
+  dataset: pusht_expert_train.lance
+  frameskip: 5
   fraction: 0.01
   num_workers: 0
   split: train
@@ -14,7 +16,19 @@ training:
   batch_size: 8
   deterministic: true
 
+model:
+  variant: mlp
+  latent_dim: 192
+  action_dim: 192
+  hidden_dim: 192
+  transformer_heads: 16
+  transformer_layers: 6
+  transformer_context_length: 3
+
 evaluation:
-  horizons: [1, 5, 10, 20]
+  rollout_horizons: [1, 5, 10, 20, 50]
+  divergence:
+    normalized_error_threshold: 10.0
+    count_non_finite_as_divergence: true
 
 # Local results validate correctness only and must not be reported as final results.

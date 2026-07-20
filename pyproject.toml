@@ -6,20 +6,38 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.0",
+    "ncps @ git+https://github.com/mlech26l/ncps.git@695ec22d7d1831f2ced67346ef7d2f08c525bd47",
     "pyyaml>=6.0",
     "torch>=2.4",
 ]
 
+[project.optional-dependencies]
+upstream = [
+    "imageio>=2.0",
+    "opencv-python-headless>=4.0",
+    "stable-worldmodel==0.1.1",
+]
+
+[project.scripts]
+lewm-liquid-predictors = "lewm_liquid_predictors.cli:main"
+
 [dependency-groups]
+data = [
+    "huggingface-hub==1.8.0",
+]
 dev = [
     "mypy>=1.13",
     "pytest>=8.3",
     "ruff>=0.8",
+    "types-PyYAML>=6.0",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.ruff]
 line-length = 100
