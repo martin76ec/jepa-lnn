@@ -203,7 +203,6 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
     from importlib import import_module
     from pathlib import Path as P
 
-    import numpy as np
     from torch.utils.data import DataLoader
 
     from lewm_liquid_predictors.data.preprocessing import (
@@ -247,13 +246,27 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
     print(f"[lewm] action_dim: {action_dim}", file=sys.stderr)
 
     print("[lewm] fitting action normalizer...", file=sys.stderr)
-    raw_actions = dataset.get_col_data("action")
-    action_tensor = torch.from_numpy(np.array(raw_actions))
+    sample = dataset[0]
+    sample_action = sample["action"]
+    if sample_action.ndim == 1:
+        sample_action = sample_action.unsqueeze(0)
+    action_dim_in_batch = sample_action.shape[-1]
+    all_actions = []
+    for i in range(min(len(dataset), 1000)):
+        act = dataset[i]["action"]
+        if act.ndim == 1:
+            act = act.unsqueeze(0)
+        all_actions.append(act.reshape(-1, action_dim_in_batch))
+    action_tensor = torch.cat(all_actions, dim=0)
     action_tensor = action_tensor[~torch.isnan(action_tensor).any(dim=1)]
     mean = action_tensor.mean(0, keepdim=True).clone()
     std = action_tensor.std(0, keepdim=True).clone()
     action_normalizer = ZScoreNormalizer(mean, std).to(device)
-    print(f"[lewm] action normalizer fitted on {action_tensor.shape[0]} samples", file=sys.stderr)
+    print(
+        f"[lewm] action normalizer fitted on {action_tensor.shape[0]}"
+        f" samples, dim={action_dim_in_batch}",
+        file=sys.stderr,
+    )
 
     print(
         "[lewm] building model (ViT-tiny + projector + ARPredictor + pred_proj + SIGReg)...",
