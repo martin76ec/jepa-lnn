@@ -9,6 +9,7 @@ dependencies = [
     "ncps @ git+https://github.com/mlech26l/ncps.git@695ec22d7d1831f2ced67346ef7d2f08c525bd47",
     "pyyaml>=6.0",
     "torch>=2.4",
+    "tqdm>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -30,7 +31,9 @@ dev = [
     "mypy>=1.13",
     "pytest>=8.3",
     "ruff>=0.8",
+    "tqdm>=4.0",
     "types-PyYAML>=6.0",
+    "types-tqdm>=4.0",
 ]
 
 [build-system]

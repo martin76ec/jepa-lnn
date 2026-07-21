@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import cast
 
 import torch
 from torch import Tensor, nn
+from tqdm import tqdm
 
 from lewm_liquid_predictors.data import (
     ObservationTrajectory,
@@ -205,11 +207,22 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
     torch.manual_seed(seed)
     device = _resolve_device(config.training.device)
 
+    print(f"[lewm] config: {parsed.config}", file=sys.stderr)
+    print(f"[lewm] seed: {seed}, device: {device}", file=sys.stderr)
+    print(f"[lewm] loading PushT data from {parsed.data_path}...", file=sys.stderr)
     trajectories = _load_trajectories(parsed.data_path, parsed.max_episodes)
     if not trajectories:
         raise RuntimeError("no trajectories loaded")
     action_input_dim = trajectories[0].actions.shape[-1]
+    print(
+        f"[lewm] loaded {len(trajectories)} episodes, action_dim={action_input_dim}",
+        file=sys.stderr,
+    )
 
+    print(
+        "[lewm] building model (ViT-tiny + projector + ARPredictor + pred_proj + SIGReg)...",
+        file=sys.stderr,
+    )
     model = build_lewm_baseline(
         latent_dim=config.model.latent_dim,
         action_dim=action_input_dim,
@@ -217,6 +230,8 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
         num_preds=1,
         sigreg_weight=0.09,
     ).to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"[lewm] model parameters: {total_params:,}", file=sys.stderr)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
     max_epochs = config.training.max_epochs or 100
@@ -226,26 +241,30 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
 
     trainer = LeWMTrainer(model, optimizer, gradient_clip_val=1.0)
 
+    print("[lewm] capturing provenance...", file=sys.stderr)
     provenance = capture_run_provenance(seed=seed, requested_device=config.training.device)
     run_dir = initialize_run(config.experiment.output_dir, config, provenance)
+    print(f"[lewm] run directory: {run_dir}", file=sys.stderr)
 
     batch_size = config.training.batch_size or 128
     img_size = 224
     history_size = config.model.transformer_context_length
     seq_len = history_size + 1  # history_size + num_preds
 
+    print("[lewm] fitting action normalizer...", file=sys.stderr)
     all_actions = torch.cat([t.actions for t in trajectories], dim=0)
     action_normalizer = fit_zscore_normalizer(all_actions)
     action_normalizer = action_normalizer.to(device)
 
+    print("[lewm] creating fixed-length sequence windows...", file=sys.stderr)
+
     def make_windows(trajs: tuple[ObservationTrajectory, ...]) -> list[dict[str, Tensor]]:
         windows: list[dict[str, Tensor]] = []
-        for traj in trajs:
+        for traj in tqdm(trajs, desc="windows", file=sys.stderr):
             obs = traj.observations
             act = traj.actions
             for start in range(0, obs.shape[0] - seq_len + 1):
                 obs_window = obs[start : start + seq_len].unsqueeze(0)
-                # Actions have one fewer entry than observations; pad to match.
                 act_window = act[start : start + seq_len - 1]
                 pad = torch.full(
                     (1, 1, act_window.shape[-1]),
@@ -261,8 +280,16 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
         return windows
 
     all_windows = make_windows(trajectories)
+    print(f"[lewm] {len(all_windows)} training windows, batch_size={batch_size}", file=sys.stderr)
+    num_batches = (len(all_windows) + batch_size - 1) // batch_size
 
-    for epoch in range(max_epochs):
+    print(
+        f"[lewm] starting training: {max_epochs} epochs, {num_batches} batches/epoch",
+        file=sys.stderr,
+    )
+    epoch_pbar = tqdm(range(max_epochs), desc="epochs", file=sys.stderr)
+
+    for epoch in epoch_pbar:
         train_batches: list[dict[str, Tensor]] = []
         for start in range(0, len(all_windows), batch_size):
             chunk = all_windows[start : start + batch_size]
@@ -272,11 +299,11 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
 
         metrics = trainer.train_epoch(train_batches)
         scheduler.step()
-        print(
-            f"epoch {epoch + 1}: loss={metrics.total_loss:.6f}"
-            f" pred={metrics.pred_loss:.6f}"
-            f" sigreg={metrics.sigreg_loss:.6f}"
-            f" lr={metrics.learning_rate:.2e}"
+        epoch_pbar.set_postfix(
+            loss=f"{metrics.total_loss:.4f}",
+            pred=f"{metrics.pred_loss:.4f}",
+            sigreg=f"{metrics.sigreg_loss:.4f}",
+            lr=f"{metrics.learning_rate:.2e}",
         )
         write_metrics(
             run_dir,
