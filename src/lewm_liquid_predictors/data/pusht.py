@@ -71,6 +71,22 @@ class ObservationTrajectoryBatch:
         if self.transition_mask.dtype != torch.bool:
             raise ValueError("transition_mask must be boolean")
 
+    def to(self, device: torch.device | str) -> ObservationTrajectoryBatch:
+        """Return a new batch with tensors moved to the target device."""
+        device_obj = torch.device(device)
+        if (
+            self.observations.device == device_obj
+            and self.actions.device == device_obj
+            and self.transition_mask.device == device_obj
+        ):
+            return self
+        return ObservationTrajectoryBatch(
+            episode_ids=self.episode_ids,
+            observations=self.observations.to(device_obj),
+            actions=self.actions.to(device_obj),
+            transition_mask=self.transition_mask.to(device_obj),
+        )
+
 
 def load_pusht_lance_episodes(
     path: str | Path,

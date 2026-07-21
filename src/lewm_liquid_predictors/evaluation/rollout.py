@@ -32,10 +32,13 @@ def evaluate_rollouts(
     """Evaluate teacher-forced and autoregressive predictions without padded tails."""
     if not horizons or any(horizon <= 0 for horizon in horizons):
         raise ValueError("horizons must contain positive values")
-    if max(horizons) > batch.actions.shape[1]:
-        raise ValueError("requested horizon exceeds the batch trajectory length")
     if divergence_threshold <= 0:
         raise ValueError("divergence_threshold must be positive")
+
+    max_available = batch.actions.shape[1]
+    available_horizons = tuple(h for h in horizons if h <= max_available)
+    if not available_horizons:
+        raise ValueError("no configured horizon fits the batch trajectory length")
 
     targets = batch.latents[:, 1:]
     teacher_forced = teacher_forced_rollout(predictor, batch.latents, batch.actions)
@@ -46,7 +49,7 @@ def evaluate_rollouts(
             targets[:, horizon - 1 : horizon],
             batch.transition_mask[:, horizon - 1 : horizon],
         )
-        for horizon in horizons
+        for horizon in available_horizons
     }
     divergence_time = divergence_times(
         rollout,
