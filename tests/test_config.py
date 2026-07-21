@@ -47,6 +47,7 @@ training:
   deterministic: true
 model:
   variant: mlp
+  encoder_mode: smoke
   latent_dim: 1
   action_dim: 1
   hidden_dim: 1

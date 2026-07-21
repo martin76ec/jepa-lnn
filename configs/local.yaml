@@ -18,6 +18,7 @@ training:
 
 model:
   variant: mlp
+  encoder_mode: smoke
   latent_dim: 192
   action_dim: 192
   hidden_dim: 192

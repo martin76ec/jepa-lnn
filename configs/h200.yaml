@@ -18,6 +18,7 @@ training:
 
 model:
   variant: mlp
+  encoder_mode: upstream
   latent_dim: 192
   action_dim: 192
   hidden_dim: 192

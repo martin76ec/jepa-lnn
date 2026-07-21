@@ -16,6 +16,7 @@ upstream = [
     "imageio>=2.0",
     "opencv-python-headless>=4.0",
     "stable-worldmodel==0.1.1",
+    "transformers>=4.50.0",
 ]
 
 [project.scripts]

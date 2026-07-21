@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 import torch
+from torch import nn
 
 from lewm_liquid_predictors.data import (
     ObservationTrajectory,
@@ -18,9 +19,14 @@ from lewm_liquid_predictors.data import (
 )
 from lewm_liquid_predictors.evaluation import evaluate_rollouts
 from lewm_liquid_predictors.models import build_predictor
+from lewm_liquid_predictors.models.encoder import LeWMEncoder
 from lewm_liquid_predictors.models.protocol import DynamicsPredictor
 from lewm_liquid_predictors.models.smoke_encoder import SmokeActionEncoder, build_smoke_encoder
 from lewm_liquid_predictors.models.system import PredictorSystem
+from lewm_liquid_predictors.models.upstream_encoder import (
+    build_upstream_action_encoder,
+    build_upstream_encoder,
+)
 from lewm_liquid_predictors.training import (
     PredictorTrainer,
     capture_run_provenance,
@@ -90,8 +96,14 @@ def _build_system(config: ExperimentConfig, action_input_dim: int) -> PredictorS
     settings = config.model
     latent_dim = settings.latent_dim
     predictor = build_predictor(settings)
-    encoder = build_smoke_encoder(latent_dim)
-    action_encoder = SmokeActionEncoder(action_input_dim, settings.action_dim)
+    if settings.encoder_mode == "upstream":
+        encoder: LeWMEncoder = build_upstream_encoder(latent_dim=latent_dim)
+        action_encoder: nn.Module = build_upstream_action_encoder(
+            action_input_dim, emb_dim=settings.action_dim
+        )
+    else:
+        encoder = build_smoke_encoder(latent_dim)
+        action_encoder = SmokeActionEncoder(action_input_dim, settings.action_dim)
     return PredictorSystem(encoder=encoder, action_encoder=action_encoder, predictor=predictor)
 
 

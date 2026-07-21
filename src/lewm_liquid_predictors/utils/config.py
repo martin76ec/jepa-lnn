@@ -10,6 +10,7 @@ from typing import Any, Literal, TypeAlias, cast
 import yaml
 
 PredictorVariant: TypeAlias = Literal["mlp", "transformer", "cfc", "ltc"]
+EncoderMode: TypeAlias = Literal["smoke", "upstream"]
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class PredictorSettings:
     """Architecture selection and dimensions shared by predictor variants."""
 
     variant: PredictorVariant
+    encoder_mode: EncoderMode
     latent_dim: int
     action_dim: int
     hidden_dim: int
@@ -131,6 +133,7 @@ def _parse_config(raw: Mapping[str, Any]) -> ExperimentConfig:
         ),
         model=PredictorSettings(
             variant=_predictor_variant(model.get("variant")),
+            encoder_mode=_encoder_mode(model.get("encoder_mode")),
             latent_dim=_positive_int(model.get("latent_dim"), "model.latent_dim"),
             action_dim=_positive_int(model.get("action_dim"), "model.action_dim"),
             hidden_dim=_positive_int(model.get("hidden_dim"), "model.hidden_dim"),
@@ -226,3 +229,10 @@ def _predictor_variant(value: Any) -> PredictorVariant:
     if variant not in {"mlp", "transformer", "cfc", "ltc"}:
         raise ValueError("model.variant must be one of: mlp, transformer, cfc, ltc")
     return cast(PredictorVariant, variant)
+
+
+def _encoder_mode(value: Any) -> EncoderMode:
+    mode = _string(value, "model.encoder_mode")
+    if mode not in {"smoke", "upstream"}:
+        raise ValueError("model.encoder_mode must be one of: smoke, upstream")
+    return cast(EncoderMode, mode)
