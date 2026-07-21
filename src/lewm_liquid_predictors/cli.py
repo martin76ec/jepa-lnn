@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import cast
@@ -321,12 +321,12 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
             drop_last=True,
             pin_memory=True,
         )
-        batches = [
-            transform_batch(raw)
-            for raw in tqdm(dataloader, desc=f"epoch {epoch + 1}", file=sys.stderr, leave=False)
-        ]
 
-        metrics = trainer.train_epoch(batches)
+        def batch_iter(dl: DataLoader[object] = dataloader) -> Generator[dict[str, Tensor]]:
+            for raw in dl:
+                yield transform_batch(raw)
+
+        metrics = trainer.train_epoch(batch_iter())
         scheduler.step()
         epoch_pbar.set_postfix(
             loss=f"{metrics.total_loss:.4f}",
