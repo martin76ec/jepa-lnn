@@ -6,7 +6,7 @@ LOCAL_CONFIG := configs/local.yaml
 H200_CONFIG := configs/h200.yaml
 
 .DEFAULT_GOAL := help
-.PHONY: help sync download-data inspect-data validate-local validate-h200 format lint typecheck test check train-local evaluate-local
+.PHONY: help sync download-data inspect-data validate-local validate-h200 format lint typecheck test check train-local evaluate-local train-lewm-local
 
 help:
 	@printf '%s\n' \
@@ -18,6 +18,7 @@ help:
 		'  validate-h200  Validate the draft H200 configuration.' \
 		'  train-local    Run a local smoke training with the local config.' \
 		'  evaluate-local Run a local smoke evaluation with the local config.' \
+		'  train-lewm-local Run a local LeWM baseline training with the two-term loss.' \
 		'  format         Format the repository with Ruff.' \
 		'  lint           Run Ruff lint checks.' \
 		'  typecheck      Run strict mypy checks.' \
@@ -44,6 +45,9 @@ train-local:
 
 evaluate-local:
 	$(UV) run --extra upstream lewm-liquid-predictors evaluate $(LOCAL_CONFIG) --max-episodes 8
+
+train-lewm-local:
+	$(UV) run --extra upstream lewm-liquid-predictors train-lewm $(LOCAL_CONFIG) --max-episodes 4
 
 format:
 	$(UV) run ruff format .

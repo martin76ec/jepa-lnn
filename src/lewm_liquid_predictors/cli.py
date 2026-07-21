@@ -10,15 +10,17 @@ from pathlib import Path
 from typing import cast
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 
 from lewm_liquid_predictors.data import (
     ObservationTrajectory,
     collate_observation_trajectories,
+    fit_zscore_normalizer,
     load_pusht_lance_episodes,
+    preprocess_observations,
 )
 from lewm_liquid_predictors.evaluation import evaluate_rollouts
-from lewm_liquid_predictors.models import build_predictor
+from lewm_liquid_predictors.models import build_lewm_baseline, build_predictor
 from lewm_liquid_predictors.models.encoder import LeWMEncoder
 from lewm_liquid_predictors.models.protocol import DynamicsPredictor
 from lewm_liquid_predictors.models.smoke_encoder import SmokeActionEncoder, build_smoke_encoder
@@ -28,7 +30,9 @@ from lewm_liquid_predictors.models.upstream_encoder import (
     build_upstream_encoder,
 )
 from lewm_liquid_predictors.training import (
+    LeWMTrainer,
     PredictorTrainer,
+    build_linear_warmup_cosine_scheduler,
     capture_run_provenance,
     initialize_run,
     write_metrics,
@@ -58,6 +62,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
     evaluate.add_argument("--data-path", default="data/raw/pusht_expert_train.lance")
     evaluate.add_argument("--max-episodes", type=int, default=None)
 
+    train_lewm = subparsers.add_parser("train-lewm")
+    train_lewm.add_argument("config", type=Path)
+    train_lewm.add_argument("--data-path", default="data/raw/pusht_expert_train.lance")
+    train_lewm.add_argument("--max-episodes", type=int, default=None)
+
     parsed = parser.parse_args(arguments)
     if parsed.command == "validate-config":
         config = load_config(parsed.config)
@@ -81,6 +90,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 0
     if parsed.command == "train":
         return _run_train(parsed)
+    if parsed.command == "train-lewm":
+        return _run_train_lewm(parsed)
     if parsed.command == "evaluate":
         return _run_evaluate(parsed)
     return 1
@@ -184,4 +195,100 @@ def _run_evaluate(parsed: argparse.Namespace) -> int:
         "divergence_rate": metrics.divergence_rate.item(),
     }
     print(json.dumps(result, indent=2))
+    return 0
+
+
+def _run_train_lewm(parsed: argparse.Namespace) -> int:
+    """Run the full LeWM baseline reproduction with two-term loss."""
+    config = load_config(parsed.config)
+    seed = config.experiment.seeds[0]
+    torch.manual_seed(seed)
+    device = _resolve_device(config.training.device)
+
+    trajectories = _load_trajectories(parsed.data_path, parsed.max_episodes)
+    if not trajectories:
+        raise RuntimeError("no trajectories loaded")
+    action_input_dim = trajectories[0].actions.shape[-1]
+
+    model = build_lewm_baseline(
+        latent_dim=config.model.latent_dim,
+        action_dim=action_input_dim,
+        history_size=config.model.transformer_context_length,
+        num_preds=1,
+        sigreg_weight=0.09,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
+    max_epochs = config.training.max_epochs or 100
+    total_steps = max_epochs * len(trajectories)
+    warmup_steps = max(1, int(0.01 * total_steps))
+    scheduler = build_linear_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps)
+
+    trainer = LeWMTrainer(model, optimizer, gradient_clip_val=1.0)
+
+    provenance = capture_run_provenance(seed=seed, requested_device=config.training.device)
+    run_dir = initialize_run(config.experiment.output_dir, config, provenance)
+
+    batch_size = config.training.batch_size or 128
+    img_size = 224
+    history_size = config.model.transformer_context_length
+    seq_len = history_size + 1  # history_size + num_preds
+
+    all_actions = torch.cat([t.actions for t in trajectories], dim=0)
+    action_normalizer = fit_zscore_normalizer(all_actions)
+    action_normalizer = action_normalizer.to(device)
+
+    def make_windows(trajs: tuple[ObservationTrajectory, ...]) -> list[dict[str, Tensor]]:
+        windows: list[dict[str, Tensor]] = []
+        for traj in trajs:
+            obs = traj.observations
+            act = traj.actions
+            for start in range(0, obs.shape[0] - seq_len + 1):
+                obs_window = obs[start : start + seq_len].unsqueeze(0)
+                # Actions have one fewer entry than observations; pad to match.
+                act_window = act[start : start + seq_len - 1]
+                pad = torch.full(
+                    (1, 1, act_window.shape[-1]),
+                    float("nan"),
+                    dtype=act_window.dtype,
+                    device=act_window.device,
+                )
+                act_window = torch.cat([act_window.unsqueeze(0), pad], dim=1)
+                pixels = preprocess_observations(obs_window, img_size=img_size).to(device)
+                actions = action_normalizer(act_window)
+                actions = torch.nan_to_num(actions, 0.0).to(device)
+                windows.append({"pixels": pixels, "action": actions})
+        return windows
+
+    all_windows = make_windows(trajectories)
+
+    for epoch in range(max_epochs):
+        train_batches: list[dict[str, Tensor]] = []
+        for start in range(0, len(all_windows), batch_size):
+            chunk = all_windows[start : start + batch_size]
+            batch_pixels = torch.cat([w["pixels"] for w in chunk], dim=0)
+            batch_actions = torch.cat([w["action"] for w in chunk], dim=0)
+            train_batches.append({"pixels": batch_pixels, "action": batch_actions})
+
+        metrics = trainer.train_epoch(train_batches)
+        scheduler.step()
+        print(
+            f"epoch {epoch + 1}: loss={metrics.total_loss:.6f}"
+            f" pred={metrics.pred_loss:.6f}"
+            f" sigreg={metrics.sigreg_loss:.6f}"
+            f" lr={metrics.learning_rate:.2e}"
+        )
+        write_metrics(
+            run_dir,
+            {
+                "epoch": epoch + 1,
+                "train/loss": metrics.total_loss,
+                "train/pred_loss": metrics.pred_loss,
+                "train/sigreg_loss": metrics.sigreg_loss,
+                "train/lr": metrics.learning_rate,
+            },
+        )
+
+    torch.save(model.state_dict(), run_dir / "lewm.pt")
+    print(f"LeWM baseline run saved to {run_dir}")
     return 0
