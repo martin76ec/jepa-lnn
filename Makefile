@@ -49,10 +49,10 @@ evaluate-local:
 	$(UV) run --extra upstream lewm-liquid-predictors evaluate $(LOCAL_CONFIG) --max-episodes 8
 
 train-lewm-local:
-	$(UV) run --extra upstream lewm-liquid-predictors train-lewm $(LOCAL_CONFIG) --max-episodes 4
+	STABLEWM_HOME=$(CURDIR)/data/raw HF_HUB_OFFLINE=1 $(UV) run --extra upstream lewm-liquid-predictors train-lewm $(LOCAL_CONFIG) --max-episodes 4
 
 train-lewm-h200:
-	$(UV) run --extra upstream lewm-liquid-predictors train-lewm $(H200_CONFIG)
+	STABLEWM_HOME=$(CURDIR)/data/raw HF_HUB_OFFLINE=1 $(UV) run --extra upstream lewm-liquid-predictors train-lewm $(H200_CONFIG)
 
 format:
 	$(UV) run ruff format .

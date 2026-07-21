@@ -230,12 +230,16 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
     dataset_path = str(parsed.data_path)
     if "://" not in dataset_path:
         dataset_path = str(P(dataset_path).resolve())
+    import os
+
+    cache_dir = os.environ.get("STABLEWM_HOME", str(P(parsed.data_path).resolve().parent))
     swm: object = import_module("stable_worldmodel")
     dataset = swm.data.load_dataset(  # type: ignore[attr-defined]
         dataset_path,
         frameskip=config.data.frameskip,
         num_steps=seq_len,
         keys_to_load=["pixels", "action"],
+        cache_dir=cache_dir,
     )
     print(f"[lewm] dataset: {len(dataset)} windows", file=sys.stderr)
 
