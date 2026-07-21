@@ -41,10 +41,12 @@ class LeWMTrainer:
         model: LeWMJEPA,
         optimizer: Optimizer,
         gradient_clip_val: float = 1.0,
+        use_amp: bool = True,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
         self.gradient_clip_val = gradient_clip_val
+        self.use_amp = use_amp and torch.cuda.is_available()
 
     def train_epoch(
         self,
@@ -59,8 +61,9 @@ class LeWMTrainer:
         num_batches = 0
 
         for batch in batches:
-            output = self.model(batch)
-            loss = output["loss"]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
+                output = self.model(batch)
+                loss = output["loss"]
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -100,7 +103,8 @@ class LeWMTrainer:
         num_batches = 0
 
         for batch in batches:
-            output = self.model(batch)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
+                output = self.model(batch)
             batch_size = batch["pixels"].shape[0]
             total_loss += output["loss"].detach().item()
             total_pred += output["pred_loss"].detach().item()
