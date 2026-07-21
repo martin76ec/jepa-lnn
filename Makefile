@@ -6,7 +6,7 @@ LOCAL_CONFIG := configs/local.yaml
 H200_CONFIG := configs/h200.yaml
 
 .DEFAULT_GOAL := help
-.PHONY: help sync download-data inspect-data validate-local validate-h200 format lint typecheck test check train-local evaluate-local train-lewm-local train-lewm-h200
+.PHONY: help sync download-data inspect-data validate-local validate-h200 format lint typecheck test check train-local evaluate-local train-lewm-local train-lewm-h200 clean
 
 help:
 	@printf '%s\n' \
@@ -24,7 +24,8 @@ help:
 		'  lint           Run Ruff lint checks.' \
 		'  typecheck      Run strict mypy checks.' \
 		'  test           Run the test suite.' \
-		'  check          Format, lint, type-check, and test.'
+		'  check          Format, lint, type-check, and test.' \
+		'  clean          Remove runs/ and caches.'
 
 sync:
 	$(UV) sync --group dev --group data --extra upstream
@@ -66,3 +67,6 @@ test:
 	$(UV) run pytest
 
 check: format lint typecheck test
+
+clean:
+	rm -rf runs/* .mypy_cache .pytest_cache .ruff_cache

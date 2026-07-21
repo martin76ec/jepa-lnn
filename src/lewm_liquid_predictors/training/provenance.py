@@ -62,8 +62,12 @@ def initialize_run(
     config: ExperimentConfig,
     provenance: RunProvenance,
 ) -> Path:
-    """Create a run directory and persist resolved config and provenance."""
-    output_dir = Path(run_dir)
+    """Create a unique run directory and persist resolved config and provenance."""
+    from datetime import UTC, datetime
+
+    base_dir = Path(run_dir)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    output_dir = base_dir / f"run_{timestamp}_seed{provenance.seed}"
     output_dir.mkdir(parents=True, exist_ok=False)
     _write_yaml(output_dir / "resolved_config.yaml", _jsonable(asdict(config)))
     _write_json(output_dir / "provenance.json", _jsonable(asdict(provenance)))
