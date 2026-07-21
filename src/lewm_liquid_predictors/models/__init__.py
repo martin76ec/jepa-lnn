@@ -2,6 +2,7 @@
 
 from .encoder import LeWMEncoder
 from .factory import build_predictor
+from .lewm import ARPredictor, LeWMJEPA, SIGReg, build_lewm_baseline
 from .liquid import PredictorCfC, PredictorLTC
 from .mlp import PredictorMLP
 from .protocol import DynamicsPredictor, PredictorState
@@ -17,18 +18,22 @@ from .upstream_encoder import (
 )
 
 __all__ = [
+    "ARPredictor",
     "DynamicsPredictor",
     "LeWMEncoder",
+    "LeWMJEPA",
     "PredictorCfC",
     "PredictorLTC",
     "PredictorMLP",
     "PredictorState",
     "PredictorSystem",
     "PredictorTransformer",
+    "SIGReg",
     "SmokeActionEncoder",
     "TransformerState",
     "UpstreamEmbedder",
     "UpstreamMLP",
+    "build_lewm_baseline",
     "build_predictor",
     "build_smoke_encoder",
     "build_upstream_action_encoder",
