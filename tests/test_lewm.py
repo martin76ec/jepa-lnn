@@ -1,8 +1,15 @@
 """Tests for the LeWM baseline reproduction."""
 
+from importlib.util import find_spec
+
+import pytest
 import torch
 
 from lewm_liquid_predictors.models import ARPredictor, SIGReg, build_lewm_baseline
+
+upstream_required = pytest.mark.skipif(
+    find_spec("transformers") is None, reason="requires transformers (upstream extra)"
+)
 
 
 def test_sigreg_returns_finite_scalar_for_gaussian_input() -> None:
@@ -70,6 +77,7 @@ def test_arpredictor_cannot_attend_future_positions() -> None:
     assert torch.allclose(output[:, :2], modified_output[:, :2], atol=1e-5)
 
 
+@upstream_required
 def test_build_lewm_baseline_produces_finite_two_term_loss() -> None:
     model = build_lewm_baseline(latent_dim=192, action_dim=10, history_size=3)
     batch = {
@@ -88,6 +96,7 @@ def test_build_lewm_baseline_produces_finite_two_term_loss() -> None:
     assert output["loss"] == output["pred_loss"] + model.sigreg_weight * output["sigreg_loss"]
 
 
+@upstream_required
 def test_lewm_baseline_loss_supports_gradients() -> None:
     model = build_lewm_baseline(latent_dim=192, action_dim=10, history_size=3)
     batch = {

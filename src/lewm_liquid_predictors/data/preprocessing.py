@@ -8,6 +8,8 @@ Upstream applies:
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import Tensor
 
@@ -41,7 +43,7 @@ def resize_observations(observations: Tensor, size: int = 224) -> Tensor:
     leading_shape = observations.shape[:-3]
     flattened = observations.reshape(-1, *observations.shape[-3:])
     resized = F.interpolate(flattened, size=(size, size), mode="bilinear", align_corners=False)
-    return resized.reshape(*leading_shape, *resized.shape[-3:])
+    return cast(Tensor, resized.reshape(*leading_shape, *resized.shape[-3:]))
 
 
 def preprocess_observations(observations: Tensor, img_size: int = 224) -> Tensor:

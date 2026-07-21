@@ -1,9 +1,16 @@
 """Tests for the LeWM baseline trainer."""
 
+from importlib.util import find_spec
+
+import pytest
 import torch
 
 from lewm_liquid_predictors.models import build_lewm_baseline
 from lewm_liquid_predictors.training import LeWMTrainer, build_linear_warmup_cosine_scheduler
+
+upstream_required = pytest.mark.skipif(
+    find_spec("transformers") is None, reason="requires transformers (upstream extra)"
+)
 
 
 def _small_batch(batch_size: int = 2, seq_len: int = 4) -> dict[str, torch.Tensor]:
@@ -13,6 +20,7 @@ def _small_batch(batch_size: int = 2, seq_len: int = 4) -> dict[str, torch.Tenso
     }
 
 
+@upstream_required
 def test_lewm_trainer_runs_one_epoch_and_updates_parameters() -> None:
     model = build_lewm_baseline(latent_dim=192, action_dim=10, history_size=3)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
@@ -29,6 +37,7 @@ def test_lewm_trainer_runs_one_epoch_and_updates_parameters() -> None:
     assert any(not torch.equal(prev, curr) for prev, curr in zip(before, after, strict=True))
 
 
+@upstream_required
 def test_lewm_trainer_validation_does_not_update_parameters() -> None:
     model = build_lewm_baseline(latent_dim=192, action_dim=10, history_size=3)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
@@ -42,6 +51,7 @@ def test_lewm_trainer_validation_does_not_update_parameters() -> None:
     assert all(torch.equal(prev, curr) for prev, curr in zip(before, after, strict=True))
 
 
+@upstream_required
 def test_linear_warmup_cosine_scheduler_starts_at_zero() -> None:
     model = build_lewm_baseline(latent_dim=192, action_dim=10, history_size=3)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
