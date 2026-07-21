@@ -12,8 +12,8 @@ data:
 
 training:
   device: cuda
-  max_epochs: null
-  batch_size: null
+  max_epochs: 100
+  batch_size: 128
   deterministic: false
 
 model:
@@ -32,4 +32,5 @@ evaluation:
     normalized_error_threshold: 10.0
     count_non_finite_as_divergence: true
 
-# Populate batch size, maximum epochs, and long horizon during pre-registration.
+# Full H200 protocol: 100 epochs, batch_size 128, 5 seeds.
+# batch_size and max_epochs match the pinned upstream config.

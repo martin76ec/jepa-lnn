@@ -19,12 +19,12 @@ def test_load_local_config_normalizes_scalar_seed_and_split() -> None:
     assert config.evaluation.rollout_horizons == (1, 5, 10, 20, 50)
 
 
-def test_load_h200_config_preserves_unresolved_training_values() -> None:
+def test_load_h200_config_has_upstream_training_values() -> None:
     config = load_config(ROOT / "configs" / "h200.yaml")
 
     assert config.experiment.seeds == (7, 19, 43, 71, 97)
-    assert config.training.batch_size is None
-    assert config.training.max_epochs is None
+    assert config.training.batch_size == 128
+    assert config.training.max_epochs == 100
 
 
 def test_config_rejects_invalid_fraction(tmp_path: Path) -> None:
