@@ -1,0 +1,36 @@
+experiment:
+  name: h200-pilot
+  seeds: [7]
+  output_dir: runs/h200-pilot
+
+data:
+  dataset: pusht_expert_train.lance
+  frameskip: 5
+  fraction: 0.1
+  num_workers: 4
+  splits: [train, validation, test]
+
+training:
+  device: cuda
+  max_epochs: 10
+  batch_size: 128
+  deterministic: false
+
+model:
+  variant: mlp
+  encoder_mode: upstream
+  latent_dim: 192
+  action_dim: 192
+  hidden_dim: 192
+  transformer_heads: 16
+  transformer_layers: 6
+  transformer_context_length: 3
+
+evaluation:
+  rollout_horizons: [1, 5, 10, 20, 50]
+  divergence:
+    normalized_error_threshold: 10.0
+    count_non_finite_as_divergence: true
+
+# Budgeted pilot only: 10% of deterministic windows for 10 epochs.
+# Do not report this as the full upstream baseline.

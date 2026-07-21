@@ -203,7 +203,7 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
     from importlib import import_module
     from pathlib import Path as P
 
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, Subset
 
     from lewm_liquid_predictors.data.preprocessing import (
         ZScoreNormalizer,
@@ -245,6 +245,16 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
     action_dim = config.data.frameskip * dataset.get_dim("action")
     print(f"[lewm] action_dim: {action_dim}", file=sys.stderr)
 
+    if config.data.fraction < 1:
+        window_count = max(1, round(len(dataset) * config.data.fraction))
+        generator = torch.Generator().manual_seed(seed)
+        indices = torch.randperm(len(dataset), generator=generator)[:window_count].tolist()
+        dataset = Subset(dataset, indices)
+        print(
+            f"[lewm] using deterministic {config.data.fraction:.1%} subset: {len(dataset)} windows",
+            file=sys.stderr,
+        )
+
     print("[lewm] fitting action normalizer...", file=sys.stderr)
     sample = dataset[0]
     sample_action = sample["action"]
@@ -284,9 +294,8 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
     max_epochs = config.training.max_epochs or 100
-    total_steps = max_epochs * len(dataset)
-    warmup_steps = max(1, int(0.01 * total_steps))
-    scheduler = build_linear_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps)
+    warmup_epochs = max(1, int(0.01 * max_epochs))
+    scheduler = build_linear_warmup_cosine_scheduler(optimizer, warmup_epochs, max_epochs)
 
     trainer = LeWMTrainer(model, optimizer, gradient_clip_val=1.0)
 
@@ -326,7 +335,7 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
             for raw in dl:
                 yield transform_batch(raw)
 
-        metrics = trainer.train_epoch(batch_iter())
+        metrics = trainer.train_epoch(batch_iter(), total_batches=len(dataloader))
         scheduler.step()
         epoch_pbar.set_postfix(
             loss=f"{metrics.total_loss:.4f}",

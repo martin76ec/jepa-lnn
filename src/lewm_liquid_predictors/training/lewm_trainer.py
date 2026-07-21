@@ -53,6 +53,7 @@ class LeWMTrainer:
     def train_epoch(
         self,
         batches: Iterable[dict[str, Tensor]],
+        total_batches: int | None = None,
     ) -> LeWMTrainMetrics:
         """Run one training epoch over pixel/action batches."""
         self.model.train()
@@ -62,7 +63,13 @@ class LeWMTrainer:
         total_transitions = 0
         num_batches = 0
 
-        pbar = tqdm(batches, desc="batches", file=sys.stderr, leave=False)
+        pbar = tqdm(
+            batches,
+            total=total_batches,
+            desc="batches",
+            file=sys.stderr,
+            leave=False,
+        )
         for batch in pbar:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
                 output = self.model(batch)
