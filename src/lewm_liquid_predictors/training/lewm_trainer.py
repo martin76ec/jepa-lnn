@@ -11,6 +11,7 @@ This reproduces the upstream ``train.py`` training behavior:
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -18,6 +19,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
+from tqdm import tqdm
 
 from lewm_liquid_predictors.models.lewm import LeWMJEPA
 
@@ -60,7 +62,8 @@ class LeWMTrainer:
         total_transitions = 0
         num_batches = 0
 
-        for batch in batches:
+        pbar = tqdm(batches, desc="batches", file=sys.stderr, leave=False)
+        for batch in pbar:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
                 output = self.model(batch)
                 loss = output["loss"]
@@ -76,6 +79,7 @@ class LeWMTrainer:
             total_sigreg += output["sigreg_loss"].detach().item()
             total_transitions += batch_size
             num_batches += 1
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         if num_batches == 0:
             raise ValueError("no batches provided")
