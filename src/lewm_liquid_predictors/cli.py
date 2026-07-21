@@ -17,9 +17,7 @@ from tqdm import tqdm
 from lewm_liquid_predictors.data import (
     ObservationTrajectory,
     collate_observation_trajectories,
-    fit_zscore_normalizer,
     load_pusht_lance_episodes,
-    preprocess_observations,
 )
 from lewm_liquid_predictors.evaluation import evaluate_rollouts
 from lewm_liquid_predictors.models import build_lewm_baseline, build_predictor
@@ -202,6 +200,18 @@ def _run_evaluate(parsed: argparse.Namespace) -> int:
 
 def _run_train_lewm(parsed: argparse.Namespace) -> int:
     """Run the full LeWM baseline reproduction with two-term loss."""
+    from importlib import import_module
+    from pathlib import Path as P
+
+    import numpy as np
+    from torch.utils.data import DataLoader
+
+    from lewm_liquid_predictors.data.preprocessing import (
+        ZScoreNormalizer,
+        normalize_pixels,
+        resize_observations,
+    )
+
     config = load_config(parsed.config)
     seed = config.experiment.seeds[0]
     torch.manual_seed(seed)
@@ -209,15 +219,37 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
 
     print(f"[lewm] config: {parsed.config}", file=sys.stderr)
     print(f"[lewm] seed: {seed}, device: {device}", file=sys.stderr)
-    print(f"[lewm] loading PushT data from {parsed.data_path}...", file=sys.stderr)
-    trajectories = _load_trajectories(parsed.data_path, parsed.max_episodes)
-    if not trajectories:
-        raise RuntimeError("no trajectories loaded")
-    action_input_dim = trajectories[0].actions.shape[-1]
-    print(
-        f"[lewm] loaded {len(trajectories)} episodes, action_dim={action_input_dim}",
-        file=sys.stderr,
+
+    batch_size = config.training.batch_size or 128
+    img_size = 224
+    history_size = config.model.transformer_context_length
+    seq_len = history_size + 1
+    num_workers = config.data.num_workers
+
+    print(f"[lewm] loading PushT dataset from {parsed.data_path}...", file=sys.stderr)
+    dataset_path = str(parsed.data_path)
+    if "://" not in dataset_path:
+        dataset_path = str(P(dataset_path).resolve())
+    swm: object = import_module("stable_worldmodel")
+    dataset = swm.data.load_dataset(  # type: ignore[attr-defined]
+        dataset_path,
+        frameskip=config.data.frameskip,
+        num_steps=seq_len,
+        keys_to_load=["pixels", "action"],
     )
+    print(f"[lewm] dataset: {len(dataset)} windows", file=sys.stderr)
+
+    action_dim = config.data.frameskip * dataset.get_dim("action")
+    print(f"[lewm] action_dim: {action_dim}", file=sys.stderr)
+
+    print("[lewm] fitting action normalizer...", file=sys.stderr)
+    raw_actions = dataset.get_col_data("action")
+    action_tensor = torch.from_numpy(np.array(raw_actions))
+    action_tensor = action_tensor[~torch.isnan(action_tensor).any(dim=1)]
+    mean = action_tensor.mean(0, keepdim=True).clone()
+    std = action_tensor.std(0, keepdim=True).clone()
+    action_normalizer = ZScoreNormalizer(mean, std).to(device)
+    print(f"[lewm] action normalizer fitted on {action_tensor.shape[0]} samples", file=sys.stderr)
 
     print(
         "[lewm] building model (ViT-tiny + projector + ARPredictor + pred_proj + SIGReg)...",
@@ -225,8 +257,8 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
     )
     model = build_lewm_baseline(
         latent_dim=config.model.latent_dim,
-        action_dim=action_input_dim,
-        history_size=config.model.transformer_context_length,
+        action_dim=action_dim,
+        history_size=history_size,
         num_preds=1,
         sigreg_weight=0.09,
     ).to(device)
@@ -235,7 +267,7 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
     max_epochs = config.training.max_epochs or 100
-    total_steps = max_epochs * len(trajectories)
+    total_steps = max_epochs * len(dataset)
     warmup_steps = max(1, int(0.01 * total_steps))
     scheduler = build_linear_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps)
 
@@ -246,58 +278,38 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
     run_dir = initialize_run(config.experiment.output_dir, config, provenance)
     print(f"[lewm] run directory: {run_dir}", file=sys.stderr)
 
-    batch_size = config.training.batch_size or 128
-    img_size = 224
-    history_size = config.model.transformer_context_length
-    seq_len = history_size + 1  # history_size + num_preds
-
-    print("[lewm] fitting action normalizer...", file=sys.stderr)
-    all_actions = torch.cat([t.actions for t in trajectories], dim=0)
-    action_normalizer = fit_zscore_normalizer(all_actions)
-    action_normalizer = action_normalizer.to(device)
-
-    print("[lewm] creating fixed-length sequence windows...", file=sys.stderr)
-
-    def make_windows(trajs: tuple[ObservationTrajectory, ...]) -> list[dict[str, Tensor]]:
-        windows: list[dict[str, Tensor]] = []
-        for traj in tqdm(trajs, desc="windows", file=sys.stderr):
-            obs = traj.observations
-            act = traj.actions
-            for start in range(0, obs.shape[0] - seq_len + 1):
-                obs_window = obs[start : start + seq_len].unsqueeze(0)
-                act_window = act[start : start + seq_len - 1]
-                pad = torch.full(
-                    (1, 1, act_window.shape[-1]),
-                    float("nan"),
-                    dtype=act_window.dtype,
-                    device=act_window.device,
-                )
-                act_window = torch.cat([act_window.unsqueeze(0), pad], dim=1)
-                pixels = preprocess_observations(obs_window, img_size=img_size).to(device)
-                actions = action_normalizer(act_window)
-                actions = torch.nan_to_num(actions, 0.0).to(device)
-                windows.append({"pixels": pixels, "action": actions})
-        return windows
-
-    all_windows = make_windows(trajectories)
-    print(f"[lewm] {len(all_windows)} training windows, batch_size={batch_size}", file=sys.stderr)
-    num_batches = (len(all_windows) + batch_size - 1) // batch_size
+    def transform_batch(raw: dict[str, Tensor]) -> dict[str, Tensor]:
+        pixels = raw["pixels"]
+        if pixels.dtype == torch.uint8:
+            pixels = pixels.float() / 255.0
+        pixels = normalize_pixels(resize_observations(pixels, img_size))
+        actions = action_normalizer(raw["action"])
+        actions = torch.nan_to_num(actions, 0.0)
+        return {"pixels": pixels.to(device), "action": actions.to(device)}
 
     print(
-        f"[lewm] starting training: {max_epochs} epochs, {num_batches} batches/epoch",
+        f"[lewm] dataloader: batch_size={batch_size}, num_workers={num_workers}",
         file=sys.stderr,
     )
+    print(f"[lewm] starting training: {max_epochs} epochs", file=sys.stderr)
+
     epoch_pbar = tqdm(range(max_epochs), desc="epochs", file=sys.stderr)
 
     for epoch in epoch_pbar:
-        train_batches: list[dict[str, Tensor]] = []
-        for start in range(0, len(all_windows), batch_size):
-            chunk = all_windows[start : start + batch_size]
-            batch_pixels = torch.cat([w["pixels"] for w in chunk], dim=0)
-            batch_actions = torch.cat([w["action"] for w in chunk], dim=0)
-            train_batches.append({"pixels": batch_pixels, "action": batch_actions})
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            drop_last=True,
+            pin_memory=True,
+        )
+        batches = [
+            transform_batch(raw)
+            for raw in tqdm(dataloader, desc=f"epoch {epoch + 1}", file=sys.stderr, leave=False)
+        ]
 
-        metrics = trainer.train_epoch(train_batches)
+        metrics = trainer.train_epoch(batches)
         scheduler.step()
         epoch_pbar.set_postfix(
             loss=f"{metrics.total_loss:.4f}",
@@ -317,5 +329,5 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
         )
 
     torch.save(model.state_dict(), run_dir / "lewm.pt")
-    print(f"LeWM baseline run saved to {run_dir}")
+    print(f"[lewm] baseline run saved to {run_dir}", file=sys.stderr)
     return 0
