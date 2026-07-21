@@ -261,7 +261,7 @@ def _run_train_lewm(parsed: argparse.Namespace) -> int:
     action_tensor = action_tensor[~torch.isnan(action_tensor).any(dim=1)]
     mean = action_tensor.mean(0, keepdim=True).clone()
     std = action_tensor.std(0, keepdim=True).clone()
-    action_normalizer = ZScoreNormalizer(mean, std).to(device)
+    action_normalizer = ZScoreNormalizer(mean, std)
     print(
         f"[lewm] action normalizer fitted on {action_tensor.shape[0]}"
         f" samples, dim={action_dim_in_batch}",
