@@ -10,7 +10,9 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 import torch
+from numpy.typing import NDArray
 from torch import Tensor, nn
 from tqdm import tqdm
 
@@ -325,6 +327,7 @@ def _run_screen(parsed: argparse.Namespace) -> int:
                 action_normalizer,
                 run_config,
                 device,
+                run_dir,
             )
             parameter_count = sum(parameter.numel() for parameter in system.predictor.parameters())
             result = {**history[-1], **test_metrics, "predictor/parameters": float(parameter_count)}
@@ -370,6 +373,7 @@ def _evaluate_screen(
     action_normalizer: ZScoreNormalizer,
     config: ExperimentConfig,
     device: torch.device,
+    run_dir: Path,
 ) -> dict[str, float]:
     """Aggregate held-out normalized errors over complete episodes."""
     system.eval()
@@ -379,6 +383,9 @@ def _evaluate_screen(
     target_sums = {key: 0.0 for key in error_sums}
     divergences = 0
     episodes = 0
+    retrieval_latents: list[Tensor] = []
+    retrieval_references: list[tuple[str, int]] = []
+    gallery_queries: list[tuple[ObservationTrajectory, Tensor]] = []
     for trajectory in trajectories:
         batch = collate_observation_trajectories([trajectory])
         prepared = next(_prepared_batches(iter([batch]), action_normalizer, device))
@@ -388,6 +395,12 @@ def _evaluate_screen(
             predictor, latent_batch.latents, latent_batch.actions
         )
         rollout, _ = predictor.rollout(latent_batch.latents[:, 0], latent_batch.actions)
+        retrieval_latents.append(latent_batch.latents[0].detach().cpu())
+        retrieval_references.extend(
+            (trajectory.episode_id, timestep) for timestep in range(latent_batch.latents.shape[1])
+        )
+        if len(gallery_queries) < 3:
+            gallery_queries.append((trajectory, rollout[0].detach().cpu()))
         _accumulate_error(
             error_sums,
             target_sums,
@@ -429,6 +442,14 @@ def _evaluate_screen(
             if target_sums[str(horizon)] > 0
         }
     )
+    _write_retrieval_galleries(
+        run_dir,
+        gallery_queries,
+        torch.cat(retrieval_latents),
+        retrieval_references,
+        {trajectory.episode_id: trajectory for trajectory in trajectories},
+        horizons,
+    )
     return metrics
 
 
@@ -449,6 +470,69 @@ def _normalized_error(error_sum: float, target_sum: float) -> float:
     if target_sum <= 0:
         raise ValueError("held-out data has no valid target energy")
     return float((error_sum / target_sum) ** 0.5)
+
+
+def _write_retrieval_galleries(
+    run_dir: Path,
+    queries: list[tuple[ObservationTrajectory, Tensor]],
+    reference_latents: Tensor,
+    references: list[tuple[str, int]],
+    trajectories: dict[str, ObservationTrajectory],
+    horizons: tuple[int, ...],
+) -> None:
+    """Save nearest-test-frame galleries as a visual latent-space diagnostic."""
+    import imageio.v3 as imageio
+
+    if reference_latents.shape[0] != len(references):
+        raise ValueError("retrieval latents and references must align")
+    records: list[dict[str, object]] = []
+    for trajectory, rollout in queries:
+        tiles: list[NDArray[np.uint8]] = []
+        for horizon in horizons:
+            if horizon > rollout.shape[0]:
+                continue
+            predicted = rollout[horizon - 1]
+            distances = (reference_latents - predicted).square().mean(dim=1)
+            index = int(distances.argmin().item())
+            reference_id, reference_timestep = references[index]
+            actual = _image_array(trajectory.observations[horizon])
+            retrieved = _image_array(trajectories[reference_id].observations[reference_timestep])
+            tiles.append(np.concatenate((actual, retrieved), axis=1))
+            records.append(
+                {
+                    "query_episode_id": trajectory.episode_id,
+                    "horizon": horizon,
+                    "actual_timestep": horizon,
+                    "retrieved_episode_id": reference_id,
+                    "retrieved_timestep": reference_timestep,
+                    "mean_squared_latent_distance": float(distances[index].item()),
+                }
+            )
+        if tiles:
+            imageio.imwrite(
+                run_dir / f"retrieval_{trajectory.episode_id}.png", np.concatenate(tiles, axis=0)
+            )
+    (run_dir / "retrieval.json").write_text(
+        json.dumps(
+            {
+                "description": "Each row pairs actual future frame (left) with nearest "
+                "held-out test-frame latent to the predicted rollout latent (right). "
+                "Retrieved frames are a proxy, not generated images.",
+                "records": records,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _image_array(observation: Tensor) -> NDArray[np.uint8]:
+    """Convert a source RGB observation to an HWC uint8 image for diagnostics."""
+    image = _channels_first(observation.unsqueeze(0)).squeeze(0)
+    if image.dtype != torch.uint8:
+        image = (image.clamp(0, 1) * 255).to(torch.uint8)
+    return np.asarray(image.permute(1, 2, 0).cpu(), dtype=np.uint8)
 
 
 def _run_train_lewm(parsed: argparse.Namespace) -> int:
