@@ -101,6 +101,14 @@ def load_pusht_lance_episodes(
     """
     if frameskip <= 0:
         raise ValueError("frameskip must be positive")
+    source = open_pusht_lance_source(path, frameskip)
+    return adapt_pusht_episodes(source, frameskip, max_episodes=max_episodes)
+
+
+def open_pusht_lance_source(path: str | Path, frameskip: int = 5) -> EpisodeSource:
+    """Open the upstream dataset without materializing its episode tensors."""
+    if frameskip <= 0:
+        raise ValueError("frameskip must be positive")
     try:
         stable_worldmodel: Any = import_module("stable_worldmodel")
     except ModuleNotFoundError as error:
@@ -110,7 +118,7 @@ def load_pusht_lance_episodes(
     dataset_path = str(path)
     if "://" not in dataset_path:
         dataset_path = str(Path(dataset_path).resolve())
-    source = cast(
+    return cast(
         EpisodeSource,
         stable_worldmodel.data.load_dataset(
             dataset_path,
@@ -119,7 +127,6 @@ def load_pusht_lance_episodes(
             keys_to_load=["pixels", "action"],
         ),
     )
-    return adapt_pusht_episodes(source, frameskip, max_episodes=max_episodes)
 
 
 def adapt_pusht_episodes(

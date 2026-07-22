@@ -20,6 +20,7 @@ class ExperimentSettings:
     name: str
     output_dir: Path
     seeds: tuple[int, ...]
+    variants: tuple[PredictorVariant, ...]
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,7 @@ def _parse_config(raw: Mapping[str, Any]) -> ExperimentConfig:
     divergence = _mapping(evaluation, "divergence")
 
     seeds = _tuple_of_ints(experiment.get("seeds", experiment.get("seed")), "seeds")
+    variants = _tuple_of_predictor_variants(experiment.get("variants"))
     splits = _tuple_of_strings(data.get("splits", data.get("split")), "splits")
     horizons = _tuple_of_ints(evaluation.get("rollout_horizons"), "rollout_horizons")
     if any(horizon <= 0 for horizon in horizons):
@@ -117,6 +119,7 @@ def _parse_config(raw: Mapping[str, Any]) -> ExperimentConfig:
             name=_string(experiment.get("name"), "experiment.name"),
             output_dir=Path(_string(experiment.get("output_dir"), "experiment.output_dir")),
             seeds=seeds,
+            variants=variants,
         ),
         data=DataSettings(
             dataset=_string(data.get("dataset"), "data.dataset"),
@@ -229,6 +232,17 @@ def _predictor_variant(value: Any) -> PredictorVariant:
     if variant not in {"lewm_ar", "mlp", "transformer", "cfc", "ltc"}:
         raise ValueError("model.variant must be one of: lewm_ar, mlp, transformer, cfc, ltc")
     return cast(PredictorVariant, variant)
+
+
+def _tuple_of_predictor_variants(value: Any) -> tuple[PredictorVariant, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError("experiment.variants must be a non-empty sequence when specified")
+    variants = tuple(_predictor_variant(item) for item in value)
+    if len(set(variants)) != len(variants):
+        raise ValueError("experiment.variants must not contain duplicates")
+    return variants
 
 
 def _encoder_mode(value: Any) -> EncoderMode:

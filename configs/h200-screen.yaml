@@ -1,13 +1,16 @@
 experiment:
   name: h200-screen
   seeds: [7, 19, 43]
+  variants: [lewm_ar, mlp, transformer, cfc, ltc]
   output_dir: runs/h200-screen
 
 data:
   dataset: pusht_expert_train.lance
   frameskip: 5
   fraction: 0.1
-  num_workers: 4
+  # Training windows retain selected episode tensors in the parent process.
+  # Keep workers disabled to avoid Docker duplicating those tensors.
+  num_workers: 0
   splits: [train, validation, test]
 
 training:

@@ -13,6 +13,7 @@ def test_load_local_config_normalizes_scalar_seed_and_split() -> None:
     config = load_config(ROOT / "configs" / "local.yaml")
 
     assert config.experiment.seeds == (7,)
+    assert config.experiment.variants == ()
     assert config.data.splits == ("train",)
     assert config.data.frameskip == 5
     assert config.training.batch_size == 8
@@ -25,6 +26,12 @@ def test_load_h200_config_has_upstream_training_values() -> None:
     assert config.experiment.seeds == (7, 19, 43, 71, 97)
     assert config.training.batch_size == 128
     assert config.training.max_epochs == 100
+
+
+def test_load_screen_config_has_explicit_variant_matrix() -> None:
+    config = load_config(ROOT / "configs" / "h200-screen.yaml")
+
+    assert config.experiment.variants == ("lewm_ar", "mlp", "transformer", "cfc", "ltc")
 
 
 def test_config_rejects_invalid_fraction(tmp_path: Path) -> None:

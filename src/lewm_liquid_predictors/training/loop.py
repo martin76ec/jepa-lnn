@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import cast
@@ -9,6 +10,7 @@ from typing import cast
 import torch
 from torch import Tensor, nn
 from torch.optim import Optimizer
+from tqdm import tqdm
 
 from lewm_liquid_predictors.data import ObservationTrajectoryBatch, TrajectoryBatch
 from lewm_liquid_predictors.models.protocol import DynamicsPredictor
@@ -44,24 +46,31 @@ class PredictorTrainer:
             else cast(DynamicsPredictor, model)
         )
 
-    def train_epoch(self, batches: Iterable[TrajectoryBatch]) -> TrainEpochMetrics:
+    def train_epoch(
+        self, batches: Iterable[TrajectoryBatch], total_batches: int | None = None
+    ) -> TrainEpochMetrics:
         """Optimize masked teacher-forced next-latent mean squared error."""
-        return self._train_latent_batches(batches)
+        return self._train_latent_batches(batches, total_batches)
 
     def train_observation_epoch(
-        self, batches: Iterable[ObservationTrajectoryBatch]
+        self, batches: Iterable[ObservationTrajectoryBatch], total_batches: int | None = None
     ) -> TrainEpochMetrics:
         """Encode raw sequences and optimize their masked next-latent loss."""
         if not isinstance(self.model, PredictorSystem):
             raise TypeError("train_observation_epoch requires a PredictorSystem")
-        return self._train_latent_batches(self.model.encode_batch(batch) for batch in batches)
+        return self._train_latent_batches(
+            (self.model.encode_batch(batch) for batch in batches), total_batches
+        )
 
-    def _train_latent_batches(self, batches: Iterable[TrajectoryBatch]) -> TrainEpochMetrics:
+    def _train_latent_batches(
+        self, batches: Iterable[TrajectoryBatch], total_batches: int | None
+    ) -> TrainEpochMetrics:
         self.model.train()
         total_squared_error = 0.0
         total_values = 0
         transitions = 0
-        for batch in batches:
+        pbar = tqdm(batches, total=total_batches, desc="batches", file=sys.stderr, leave=False)
+        for batch in pbar:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
                 predictions = teacher_forced_rollout(self.predictor, batch.latents, batch.actions)
                 targets = batch.latents[:, 1:]
@@ -76,6 +85,7 @@ class PredictorTrainer:
             total_squared_error += loss.detach().item() * values
             total_values += values
             transitions += int(batch.transition_mask.sum().item())
+            pbar.set_postfix(mse=f"{loss.item():.5f}")
         if total_values == 0:
             raise ValueError("batches contain no valid transitions")
         return TrainEpochMetrics(

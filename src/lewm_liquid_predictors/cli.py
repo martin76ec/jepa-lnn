@@ -19,14 +19,17 @@ from tqdm import tqdm
 from lewm_liquid_predictors.data import (
     ObservationTrajectory,
     ObservationTrajectoryBatch,
+    adapt_pusht_episode,
     collate_observation_trajectories,
     load_pusht_lance_episodes,
+    open_pusht_lance_source,
 )
 from lewm_liquid_predictors.data.preprocessing import (
     ZScoreNormalizer,
     fit_zscore_normalizer,
     preprocess_observations,
 )
+from lewm_liquid_predictors.data.pusht import EpisodeSource
 from lewm_liquid_predictors.data.splits import (
     create_split_manifest,
     sample_episode_ids,
@@ -54,7 +57,7 @@ from lewm_liquid_predictors.training import (
     initialize_run,
     write_metrics,
 )
-from lewm_liquid_predictors.utils import ExperimentConfig, PredictorVariant, load_config
+from lewm_liquid_predictors.utils import ExperimentConfig, load_config
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -228,20 +231,24 @@ def _run_screen(parsed: argparse.Namespace) -> int:
     config = load_config(parsed.config)
     if config.model.encoder_mode != "upstream":
         raise ValueError("screen requires model.encoder_mode: upstream")
-    trajectories = _load_trajectories(parsed.data_path, max_episodes=None)
-    if not trajectories:
-        raise RuntimeError("no trajectories loaded")
-    episode_ids = tuple(trajectory.episode_id for trajectory in trajectories)
+    if not config.experiment.variants:
+        raise ValueError("screen requires experiment.variants")
+    print(f"[screen] config: {parsed.config}", file=sys.stderr, flush=True)
+    print("[screen] opening PushT dataset...", file=sys.stderr, flush=True)
+    source = open_pusht_lance_source(parsed.data_path, config.data.frameskip)
+    episode_ids = tuple(f"episode-{index:06d}" for index in range(len(source.lengths)))
     manifest = create_split_manifest(
         config.data.dataset, episode_ids, seed=config.experiment.seeds[0]
     )
     output_root = config.experiment.output_dir
     output_root.mkdir(parents=True, exist_ok=True)
     write_split_manifest(manifest, output_root / "split_manifest.json")
-    by_id = {trajectory.episode_id: trajectory for trajectory in trajectories}
     train_ids = sample_episode_ids(manifest.train, config.data.fraction, manifest.seed)
-    train_trajectories = tuple(by_id[episode_id] for episode_id in train_ids)
-    test_trajectories = tuple(by_id[episode_id] for episode_id in manifest.test)
+    train_trajectories = tuple(
+        _load_source_episode(source, _episode_index(episode_id), config.data.frameskip)
+        for episode_id in train_ids
+    )
+    test_indices = tuple(_episode_index(episode_id) for episode_id in manifest.test)
     action_normalizer = fit_zscore_normalizer(
         torch.cat([item.actions for item in train_trajectories])
     )
@@ -270,9 +277,14 @@ def _run_screen(parsed: argparse.Namespace) -> int:
             )
 
     train_dataset = WindowDataset(train_trajectories)
-    variants: tuple[PredictorVariant, ...] = ("lewm_ar", "mlp", "transformer", "cfc", "ltc")
+    print(
+        f"[screen] episodes: train={len(train_trajectories)}, test={len(test_indices)}; "
+        f"train_windows={len(train_dataset)}; variants={','.join(config.experiment.variants)}",
+        file=sys.stderr,
+        flush=True,
+    )
     for seed in config.experiment.seeds:
-        for variant in variants:
+        for variant in config.experiment.variants:
             torch.manual_seed(seed)
             device = _resolve_device(config.training.device)
             run_config = replace(
@@ -297,8 +309,14 @@ def _run_screen(parsed: argparse.Namespace) -> int:
                 run_config,
                 capture_run_provenance(seed=seed, requested_device=run_config.training.device),
             )
+            print(
+                f"[screen] variant={variant}, seed={seed}, run={run_dir}",
+                file=sys.stderr,
+                flush=True,
+            )
             history: list[dict[str, float]] = []
-            for epoch in tqdm(range(epochs), desc=f"{variant}/seed{seed}", file=sys.stderr):
+            epoch_pbar = tqdm(range(epochs), desc=f"{variant}/seed{seed}", file=sys.stderr)
+            for epoch in epoch_pbar:
                 generator = torch.Generator().manual_seed(seed + epoch)
                 loader = DataLoader(
                     train_dataset,
@@ -311,7 +329,7 @@ def _run_screen(parsed: argparse.Namespace) -> int:
                     collate_fn=collate_observation_trajectories,
                 )
                 metrics = trainer.train_observation_epoch(
-                    _prepared_batches(loader, action_normalizer, device)
+                    _prepared_batches(loader, action_normalizer, device), total_batches=len(loader)
                 )
                 history.append(
                     {
@@ -321,9 +339,18 @@ def _run_screen(parsed: argparse.Namespace) -> int:
                     }
                 )
                 scheduler.step()
+                epoch_pbar.set_postfix(mse=f"{metrics.mean_squared_error:.5f}")
+                print(
+                    f"[screen] variant={variant}, seed={seed}, epoch={epoch + 1}/{epochs}, "
+                    f"mse={metrics.mean_squared_error:.6f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            print("[screen] evaluating held-out test episodes...", file=sys.stderr, flush=True)
             test_metrics = _evaluate_screen(
                 system,
-                test_trajectories,
+                source,
+                test_indices,
                 action_normalizer,
                 run_config,
                 device,
@@ -369,7 +396,8 @@ def _channels_first(observations: Tensor) -> Tensor:
 @torch.no_grad()
 def _evaluate_screen(
     system: PredictorSystem,
-    trajectories: tuple[ObservationTrajectory, ...],
+    source: EpisodeSource,
+    test_indices: tuple[int, ...],
     action_normalizer: ZScoreNormalizer,
     config: ExperimentConfig,
     device: torch.device,
@@ -384,9 +412,10 @@ def _evaluate_screen(
     divergences = 0
     episodes = 0
     retrieval_latents: list[Tensor] = []
-    retrieval_references: list[tuple[str, int]] = []
+    retrieval_references: list[tuple[int, int]] = []
     gallery_queries: list[tuple[ObservationTrajectory, Tensor]] = []
-    for trajectory in trajectories:
+    for episode_index in test_indices:
+        trajectory = _load_source_episode(source, episode_index, config.data.frameskip)
         batch = collate_observation_trajectories([trajectory])
         prepared = next(_prepared_batches(iter([batch]), action_normalizer, device))
         latent_batch = system.encode_batch(prepared)
@@ -397,7 +426,7 @@ def _evaluate_screen(
         rollout, _ = predictor.rollout(latent_batch.latents[:, 0], latent_batch.actions)
         retrieval_latents.append(latent_batch.latents[0].detach().cpu())
         retrieval_references.extend(
-            (trajectory.episode_id, timestep) for timestep in range(latent_batch.latents.shape[1])
+            (episode_index, timestep) for timestep in range(latent_batch.latents.shape[1])
         )
         if len(gallery_queries) < 3:
             gallery_queries.append((trajectory, rollout[0].detach().cpu()))
@@ -447,7 +476,8 @@ def _evaluate_screen(
         gallery_queries,
         torch.cat(retrieval_latents),
         retrieval_references,
-        {trajectory.episode_id: trajectory for trajectory in trajectories},
+        source,
+        config.data.frameskip,
         horizons,
     )
     return metrics
@@ -476,8 +506,9 @@ def _write_retrieval_galleries(
     run_dir: Path,
     queries: list[tuple[ObservationTrajectory, Tensor]],
     reference_latents: Tensor,
-    references: list[tuple[str, int]],
-    trajectories: dict[str, ObservationTrajectory],
+    references: list[tuple[int, int]],
+    source: EpisodeSource,
+    frameskip: int,
     horizons: tuple[int, ...],
 ) -> None:
     """Save nearest-test-frame galleries as a visual latent-space diagnostic."""
@@ -494,16 +525,17 @@ def _write_retrieval_galleries(
             predicted = rollout[horizon - 1]
             distances = (reference_latents - predicted).square().mean(dim=1)
             index = int(distances.argmin().item())
-            reference_id, reference_timestep = references[index]
+            reference_index, reference_timestep = references[index]
+            reference = _load_source_episode(source, reference_index, frameskip)
             actual = _image_array(trajectory.observations[horizon])
-            retrieved = _image_array(trajectories[reference_id].observations[reference_timestep])
+            retrieved = _image_array(reference.observations[reference_timestep])
             tiles.append(np.concatenate((actual, retrieved), axis=1))
             records.append(
                 {
                     "query_episode_id": trajectory.episode_id,
                     "horizon": horizon,
                     "actual_timestep": horizon,
-                    "retrieved_episode_id": reference_id,
+                    "retrieved_episode_id": reference.episode_id,
                     "retrieved_timestep": reference_timestep,
                     "mean_squared_latent_distance": float(distances[index].item()),
                 }
@@ -533,6 +565,23 @@ def _image_array(observation: Tensor) -> NDArray[np.uint8]:
     if image.dtype != torch.uint8:
         image = (image.clamp(0, 1) * 255).to(torch.uint8)
     return np.asarray(image.permute(1, 2, 0).cpu(), dtype=np.uint8)
+
+
+def _episode_index(episode_id: str) -> int:
+    """Parse the stable episode identifier emitted by the adapter."""
+    prefix = "episode-"
+    if not episode_id.startswith(prefix):
+        raise ValueError(f"invalid episode ID: {episode_id}")
+    return int(episode_id.removeprefix(prefix))
+
+
+def _load_source_episode(
+    source: EpisodeSource, episode_index: int, frameskip: int
+) -> ObservationTrajectory:
+    """Materialize exactly one complete episode from the open Lance source."""
+    return adapt_pusht_episode(
+        f"episode-{episode_index:06d}", source.load_episode(episode_index), frameskip
+    )
 
 
 def _run_train_lewm(parsed: argparse.Namespace) -> int:

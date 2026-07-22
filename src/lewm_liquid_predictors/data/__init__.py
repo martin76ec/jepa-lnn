@@ -16,6 +16,7 @@ from .pusht import (
     adapt_pusht_episodes,
     collate_observation_trajectories,
     load_pusht_lance_episodes,
+    open_pusht_lance_source,
 )
 from .splits import (
     SplitManifest,
@@ -43,6 +44,7 @@ __all__ = [
     "create_split_manifest",
     "fit_zscore_normalizer",
     "load_pusht_lance_episodes",
+    "open_pusht_lance_source",
     "load_split_manifest",
     "normalize_pixels",
     "preprocess_observations",
