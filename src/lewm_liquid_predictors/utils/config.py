@@ -9,7 +9,7 @@ from typing import Any, Literal, TypeAlias, cast
 
 import yaml
 
-PredictorVariant: TypeAlias = Literal["mlp", "transformer", "cfc", "ltc"]
+PredictorVariant: TypeAlias = Literal["lewm_ar", "mlp", "transformer", "cfc", "ltc"]
 EncoderMode: TypeAlias = Literal["smoke", "upstream"]
 
 
@@ -226,8 +226,8 @@ def _tuple_of_strings(value: Any, name: str) -> tuple[str, ...]:
 
 def _predictor_variant(value: Any) -> PredictorVariant:
     variant = _string(value, "model.variant")
-    if variant not in {"mlp", "transformer", "cfc", "ltc"}:
-        raise ValueError("model.variant must be one of: mlp, transformer, cfc, ltc")
+    if variant not in {"lewm_ar", "mlp", "transformer", "cfc", "ltc"}:
+        raise ValueError("model.variant must be one of: lewm_ar, mlp, transformer, cfc, ltc")
     return cast(PredictorVariant, variant)
 
 

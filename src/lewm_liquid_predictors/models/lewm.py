@@ -13,6 +13,7 @@ The upstream ``module.py`` and ``jepa.py`` are the source of truth.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import cast
 
 import torch
@@ -244,6 +245,78 @@ class ARPredictor(nn.Module):
         x = x + self.pos_embedding[:, :t]
         x = self.dropout(x)
         return cast(Tensor, self.transformer(x, c))
+
+
+@dataclass(frozen=True)
+class LeWMARState:
+    """Bounded latent/action history for ``LeWMARPredictor``."""
+
+    latents: Tensor
+    actions: Tensor
+
+
+class LeWMARPredictor(nn.Module):
+    """Expose LeWM's AR prediction branch through the shared dynamics API."""
+
+    def __init__(self, latent_dim: int, action_dim: int, history_size: int) -> None:
+        super().__init__()
+        self.history_size = history_size
+        self.predictor = ARPredictor(
+            num_frames=history_size,
+            depth=6,
+            heads=16,
+            mlp_dim=2048,
+            input_dim=latent_dim,
+            hidden_dim=latent_dim,
+            output_dim=latent_dim,
+            dim_head=64,
+            dropout=0.1,
+        )
+        self.pred_proj = UpstreamMLP(latent_dim, 2048, latent_dim)
+        self.latent_dim = latent_dim
+        self.action_dim = action_dim
+
+    def init_state(self, batch_size: int, device: str) -> LeWMARState:
+        """Create an empty per-episode history."""
+        return LeWMARState(
+            latents=torch.empty(batch_size, 0, self.latent_dim, device=device),
+            actions=torch.empty(batch_size, 0, self.action_dim, device=device),
+        )
+
+    def step(
+        self,
+        latent: Tensor,
+        action: Tensor,
+        state: LeWMARState | None,
+        dt: Tensor | None,
+    ) -> tuple[Tensor, LeWMARState]:
+        """Predict one latent state from a bounded observed context."""
+        del dt
+        if state is None:
+            state = self.init_state(latent.shape[0], str(latent.device))
+        latents = torch.cat((state.latents, latent.unsqueeze(1)), dim=1)[:, -self.history_size :]
+        actions = torch.cat((state.actions, action.unsqueeze(1)), dim=1)[:, -self.history_size :]
+        prediction = self.predictor(latents, actions)[:, -1]
+        prediction = self.pred_proj(prediction)
+        return prediction, LeWMARState(latents=latents, actions=actions)
+
+    def rollout(
+        self,
+        initial_latent: Tensor,
+        actions: Tensor,
+        state: LeWMARState | None = None,
+        dt: Tensor | None = None,
+    ) -> tuple[Tensor, LeWMARState]:
+        """Autoregressively predict a sequence of future latent states."""
+        predictions: list[Tensor] = []
+        latent = initial_latent
+        for index, action in enumerate(actions.unbind(dim=1)):
+            step_dt = dt if dt is None or dt.ndim < 2 else dt[:, index]
+            latent, state = self.step(latent, action, state, step_dt)
+            predictions.append(latent)
+        if state is None:
+            state = self.init_state(initial_latent.shape[0], str(initial_latent.device))
+        return torch.stack(predictions, dim=1), state
 
 
 def rearrange(tensor: Tensor, pattern: str, **kwargs: int) -> Tensor:

@@ -27,9 +27,17 @@ class TrainEpochMetrics:
 class PredictorTrainer:
     """Train an ``nn.Module`` that implements the shared predictor protocol."""
 
-    def __init__(self, model: nn.Module, optimizer: Optimizer) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: Optimizer,
+        gradient_clip_val: float | None = None,
+        use_amp: bool = True,
+    ) -> None:
         self.model = model
         self.optimizer = optimizer
+        self.gradient_clip_val = gradient_clip_val
+        self.use_amp = use_amp and torch.cuda.is_available()
         self.predictor = (
             cast(DynamicsPredictor, model.predictor)
             if isinstance(model, PredictorSystem)
@@ -54,11 +62,14 @@ class PredictorTrainer:
         total_values = 0
         transitions = 0
         for batch in batches:
-            predictions = teacher_forced_rollout(self.predictor, batch.latents, batch.actions)
-            targets = batch.latents[:, 1:]
-            loss = masked_transition_mse(predictions, targets, batch.transition_mask)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
+                predictions = teacher_forced_rollout(self.predictor, batch.latents, batch.actions)
+                targets = batch.latents[:, 1:]
+                loss = masked_transition_mse(predictions, targets, batch.transition_mask)
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()  # type: ignore[no-untyped-call]
+            if self.gradient_clip_val is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_val)
             self.optimizer.step()
 
             values = int(batch.transition_mask.sum().item()) * targets.shape[-1]

@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Generator, Sequence
-from dataclasses import asdict
+from collections.abc import Generator, Iterable, Sequence
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import cast
 
@@ -16,11 +16,26 @@ from tqdm import tqdm
 
 from lewm_liquid_predictors.data import (
     ObservationTrajectory,
+    ObservationTrajectoryBatch,
     collate_observation_trajectories,
     load_pusht_lance_episodes,
 )
-from lewm_liquid_predictors.evaluation import evaluate_rollouts
-from lewm_liquid_predictors.models import build_lewm_baseline, build_predictor
+from lewm_liquid_predictors.data.preprocessing import (
+    ZScoreNormalizer,
+    fit_zscore_normalizer,
+    preprocess_observations,
+)
+from lewm_liquid_predictors.data.splits import (
+    create_split_manifest,
+    sample_episode_ids,
+    write_split_manifest,
+)
+from lewm_liquid_predictors.evaluation import divergence_times, evaluate_rollouts
+from lewm_liquid_predictors.models import (
+    build_lewm_baseline,
+    build_predictor,
+    teacher_forced_rollout,
+)
 from lewm_liquid_predictors.models.encoder import LeWMEncoder
 from lewm_liquid_predictors.models.protocol import DynamicsPredictor
 from lewm_liquid_predictors.models.smoke_encoder import SmokeActionEncoder, build_smoke_encoder
@@ -37,7 +52,7 @@ from lewm_liquid_predictors.training import (
     initialize_run,
     write_metrics,
 )
-from lewm_liquid_predictors.utils import ExperimentConfig, load_config
+from lewm_liquid_predictors.utils import ExperimentConfig, PredictorVariant, load_config
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -67,6 +82,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
     train_lewm.add_argument("--data-path", default="data/raw/pusht_expert_train.lance")
     train_lewm.add_argument("--max-episodes", type=int, default=None)
 
+    screen = subparsers.add_parser("screen")
+    screen.add_argument("config", type=Path)
+    screen.add_argument("--data-path", default="data/raw/pusht_expert_train.lance")
+
     parsed = parser.parse_args(arguments)
     if parsed.command == "validate-config":
         config = load_config(parsed.config)
@@ -94,6 +113,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _run_train_lewm(parsed)
     if parsed.command == "evaluate":
         return _run_evaluate(parsed)
+    if parsed.command == "screen":
+        return _run_screen(parsed)
     return 1
 
 
@@ -196,6 +217,238 @@ def _run_evaluate(parsed: argparse.Namespace) -> int:
     }
     print(json.dumps(result, indent=2))
     return 0
+
+
+def _run_screen(parsed: argparse.Namespace) -> int:
+    """Run the fixed-budget, held-out predictor comparison on H200."""
+    from torch.utils.data import DataLoader, Dataset
+
+    config = load_config(parsed.config)
+    if config.model.encoder_mode != "upstream":
+        raise ValueError("screen requires model.encoder_mode: upstream")
+    trajectories = _load_trajectories(parsed.data_path, max_episodes=None)
+    if not trajectories:
+        raise RuntimeError("no trajectories loaded")
+    episode_ids = tuple(trajectory.episode_id for trajectory in trajectories)
+    manifest = create_split_manifest(
+        config.data.dataset, episode_ids, seed=config.experiment.seeds[0]
+    )
+    output_root = config.experiment.output_dir
+    output_root.mkdir(parents=True, exist_ok=True)
+    write_split_manifest(manifest, output_root / "split_manifest.json")
+    by_id = {trajectory.episode_id: trajectory for trajectory in trajectories}
+    train_ids = sample_episode_ids(manifest.train, config.data.fraction, manifest.seed)
+    train_trajectories = tuple(by_id[episode_id] for episode_id in train_ids)
+    test_trajectories = tuple(by_id[episode_id] for episode_id in manifest.test)
+    action_normalizer = fit_zscore_normalizer(
+        torch.cat([item.actions for item in train_trajectories])
+    )
+    action_input_dim = train_trajectories[0].actions.shape[-1]
+    window_size = config.model.transformer_context_length + 1
+
+    class WindowDataset(Dataset[ObservationTrajectory]):
+        def __init__(self, items: tuple[ObservationTrajectory, ...]) -> None:
+            self.windows = tuple(
+                (item, start)
+                for item in items
+                for start in range(item.actions.shape[0] - window_size + 2)
+            )
+            if not self.windows:
+                raise ValueError("training trajectories are shorter than the context window")
+
+        def __len__(self) -> int:
+            return len(self.windows)
+
+        def __getitem__(self, index: int) -> ObservationTrajectory:
+            trajectory, start = self.windows[index]
+            return ObservationTrajectory(
+                episode_id=trajectory.episode_id,
+                observations=trajectory.observations[start : start + window_size],
+                actions=trajectory.actions[start : start + window_size - 1],
+            )
+
+    train_dataset = WindowDataset(train_trajectories)
+    variants: tuple[PredictorVariant, ...] = ("lewm_ar", "mlp", "transformer", "cfc", "ltc")
+    for seed in config.experiment.seeds:
+        for variant in variants:
+            torch.manual_seed(seed)
+            device = _resolve_device(config.training.device)
+            run_config = replace(
+                config,
+                experiment=replace(
+                    config.experiment,
+                    name=f"{config.experiment.name}-{variant}",
+                    output_dir=output_root / variant,
+                    seeds=(seed,),
+                ),
+                model=replace(config.model, variant=variant),
+            )
+            system = _build_system(run_config, action_input_dim).to(device)
+            optimizer = torch.optim.AdamW(system.parameters(), lr=5e-5, weight_decay=1e-3)
+            epochs = run_config.training.max_epochs or 1
+            scheduler = build_linear_warmup_cosine_scheduler(
+                optimizer, max(1, int(0.01 * epochs)), epochs
+            )
+            trainer = PredictorTrainer(system, optimizer, gradient_clip_val=1.0)
+            run_dir = initialize_run(
+                run_config.experiment.output_dir,
+                run_config,
+                capture_run_provenance(seed=seed, requested_device=run_config.training.device),
+            )
+            history: list[dict[str, float]] = []
+            for epoch in tqdm(range(epochs), desc=f"{variant}/seed{seed}", file=sys.stderr):
+                generator = torch.Generator().manual_seed(seed + epoch)
+                loader = DataLoader(
+                    train_dataset,
+                    batch_size=run_config.training.batch_size or 128,
+                    shuffle=True,
+                    generator=generator,
+                    num_workers=run_config.data.num_workers,
+                    pin_memory=True,
+                    drop_last=True,
+                    collate_fn=collate_observation_trajectories,
+                )
+                metrics = trainer.train_observation_epoch(
+                    _prepared_batches(loader, action_normalizer, device)
+                )
+                history.append(
+                    {
+                        "epoch": float(epoch + 1),
+                        "train/mse": metrics.mean_squared_error,
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                    }
+                )
+                scheduler.step()
+            test_metrics = _evaluate_screen(
+                system,
+                test_trajectories,
+                action_normalizer,
+                run_config,
+                device,
+            )
+            parameter_count = sum(parameter.numel() for parameter in system.predictor.parameters())
+            result = {**history[-1], **test_metrics, "predictor/parameters": float(parameter_count)}
+            write_metrics(run_dir, result)
+            (run_dir / "history.json").write_text(
+                json.dumps(history, indent=2) + "\n", encoding="utf-8"
+            )
+            torch.save(system.state_dict(), run_dir / "system.pt")
+            print(json.dumps({"variant": variant, "seed": seed, **result}, sort_keys=True))
+    return 0
+
+
+def _prepared_batches(
+    batches: Iterable[ObservationTrajectoryBatch],
+    action_normalizer: ZScoreNormalizer,
+    device: torch.device,
+) -> Generator[ObservationTrajectoryBatch, None, None]:
+    """Apply common CPU preprocessing before moving a batch to the accelerator."""
+    for batch in batches:
+        observations = _channels_first(batch.observations)
+        prepared = ObservationTrajectoryBatch(
+            episode_ids=batch.episode_ids,
+            observations=preprocess_observations(observations),
+            actions=torch.nan_to_num(action_normalizer(batch.actions), 0.0),
+            transition_mask=batch.transition_mask,
+        )
+        yield prepared.to(device)
+
+
+def _channels_first(observations: Tensor) -> Tensor:
+    """Accept either CHW or HWC source pixels while enforcing the encoder layout."""
+    if observations.shape[-3] == 3:
+        return observations
+    if observations.shape[-1] == 3:
+        return observations.movedim(-1, -3)
+    raise ValueError("pixels must be RGB in CHW or HWC layout")
+
+
+@torch.no_grad()
+def _evaluate_screen(
+    system: PredictorSystem,
+    trajectories: tuple[ObservationTrajectory, ...],
+    action_normalizer: ZScoreNormalizer,
+    config: ExperimentConfig,
+    device: torch.device,
+) -> dict[str, float]:
+    """Aggregate held-out normalized errors over complete episodes."""
+    system.eval()
+    predictor = cast(DynamicsPredictor, system.predictor)
+    horizons = config.evaluation.rollout_horizons
+    error_sums = {"one_step": 0.0, **{str(horizon): 0.0 for horizon in horizons}}
+    target_sums = {key: 0.0 for key in error_sums}
+    divergences = 0
+    episodes = 0
+    for trajectory in trajectories:
+        batch = collate_observation_trajectories([trajectory])
+        prepared = next(_prepared_batches(iter([batch]), action_normalizer, device))
+        latent_batch = system.encode_batch(prepared)
+        targets = latent_batch.latents[:, 1:]
+        teacher_forced = teacher_forced_rollout(
+            predictor, latent_batch.latents, latent_batch.actions
+        )
+        rollout, _ = predictor.rollout(latent_batch.latents[:, 0], latent_batch.actions)
+        _accumulate_error(
+            error_sums,
+            target_sums,
+            "one_step",
+            teacher_forced,
+            targets,
+            latent_batch.transition_mask,
+        )
+        for horizon in horizons:
+            if horizon <= rollout.shape[1]:
+                _accumulate_error(
+                    error_sums,
+                    target_sums,
+                    str(horizon),
+                    rollout[:, horizon - 1 : horizon],
+                    targets[:, horizon - 1 : horizon],
+                    latent_batch.transition_mask[:, horizon - 1 : horizon],
+                )
+        divergence = divergence_times(
+            rollout,
+            targets,
+            latent_batch.transition_mask,
+            config.evaluation.divergence.normalized_error_threshold,
+        )
+        divergences += int((divergence >= 0).sum().item())
+        episodes += 1
+    metrics = {
+        "test/one_step_normalized_rmse": _normalized_error(
+            error_sums["one_step"], target_sums["one_step"]
+        ),
+        "test/divergence_rate": divergences / episodes,
+    }
+    metrics.update(
+        {
+            f"test/rollout_normalized_rmse/{horizon}": _normalized_error(
+                error_sums[str(horizon)], target_sums[str(horizon)]
+            )
+            for horizon in horizons
+            if target_sums[str(horizon)] > 0
+        }
+    )
+    return metrics
+
+
+def _accumulate_error(
+    error_sums: dict[str, float],
+    target_sums: dict[str, float],
+    key: str,
+    predictions: Tensor,
+    targets: Tensor,
+    mask: Tensor,
+) -> None:
+    expanded_mask = mask.unsqueeze(-1)
+    error_sums[key] += float(((predictions - targets).square() * expanded_mask).sum().item())
+    target_sums[key] += float((targets.square() * expanded_mask).sum().item())
+
+
+def _normalized_error(error_sum: float, target_sum: float) -> float:
+    if target_sum <= 0:
+        raise ValueError("held-out data has no valid target energy")
+    return float((error_sum / target_sum) ** 0.5)
 
 
 def _run_train_lewm(parsed: argparse.Namespace) -> int:

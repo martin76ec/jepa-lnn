@@ -6,6 +6,7 @@ from torch import nn
 
 from lewm_liquid_predictors.utils.config import PredictorSettings
 
+from .lewm import LeWMARPredictor
 from .liquid import PredictorCfC, PredictorLTC
 from .mlp import PredictorMLP
 from .transformer import PredictorTransformer
@@ -13,6 +14,12 @@ from .transformer import PredictorTransformer
 
 def build_predictor(settings: PredictorSettings) -> nn.Module:
     """Build one predictor variant from the common typed configuration."""
+    if settings.variant == "lewm_ar":
+        return LeWMARPredictor(
+            settings.latent_dim,
+            settings.action_dim,
+            settings.transformer_context_length,
+        )
     if settings.variant == "mlp":
         return PredictorMLP(settings.latent_dim, settings.action_dim, settings.hidden_dim)
     if settings.variant == "transformer":

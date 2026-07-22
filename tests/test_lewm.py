@@ -5,7 +5,7 @@ from importlib.util import find_spec
 import pytest
 import torch
 
-from lewm_liquid_predictors.models import ARPredictor, SIGReg, build_lewm_baseline
+from lewm_liquid_predictors.models import ARPredictor, LeWMARPredictor, SIGReg, build_lewm_baseline
 
 upstream_required = pytest.mark.skipif(
     find_spec("transformers") is None, reason="requires transformers (upstream extra)"
@@ -75,6 +75,23 @@ def test_arpredictor_cannot_attend_future_positions() -> None:
 
     # Causal: positions 0 and 1 must not change when future action changes.
     assert torch.allclose(output[:, :2], modified_output[:, :2], atol=1e-5)
+
+
+def test_lewm_ar_adapter_rollout_matches_repeated_steps() -> None:
+    predictor = LeWMARPredictor(latent_dim=192, action_dim=192, history_size=3).eval()
+    initial = torch.randn(2, 192)
+    actions = torch.randn(2, 4, 192)
+
+    with torch.no_grad():
+        rollout, _ = predictor.rollout(initial, actions)
+        state = predictor.init_state(initial.shape[0], str(initial.device))
+        latent = initial
+        repeated = []
+        for action in actions.unbind(dim=1):
+            latent, state = predictor.step(latent, action, state, None)
+            repeated.append(latent)
+
+    assert torch.allclose(rollout, torch.stack(repeated, dim=1), atol=1e-6)
 
 
 @upstream_required
