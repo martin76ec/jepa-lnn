@@ -109,10 +109,17 @@ def _parse_config(raw: Mapping[str, Any]) -> ExperimentConfig:
     horizons = _tuple_of_ints(evaluation.get("rollout_horizons"), "rollout_horizons")
     if any(horizon <= 0 for horizon in horizons):
         raise ValueError("rollout_horizons must contain only positive values")
+    if len(set(horizons)) != len(horizons):
+        raise ValueError("rollout_horizons must not contain duplicates")
 
     fraction = _float(data.get("fraction"), "fraction")
     if not 0 < fraction <= 1:
         raise ValueError("fraction must be greater than 0 and at most 1")
+
+    hidden_dim = _positive_int(model.get("hidden_dim"), "model.hidden_dim")
+    transformer_heads = _positive_int(model.get("transformer_heads"), "model.transformer_heads")
+    if hidden_dim % transformer_heads != 0:
+        raise ValueError("model.hidden_dim must be divisible by model.transformer_heads")
 
     return ExperimentConfig(
         experiment=ExperimentSettings(
@@ -139,10 +146,8 @@ def _parse_config(raw: Mapping[str, Any]) -> ExperimentConfig:
             encoder_mode=_encoder_mode(model.get("encoder_mode")),
             latent_dim=_positive_int(model.get("latent_dim"), "model.latent_dim"),
             action_dim=_positive_int(model.get("action_dim"), "model.action_dim"),
-            hidden_dim=_positive_int(model.get("hidden_dim"), "model.hidden_dim"),
-            transformer_heads=_positive_int(
-                model.get("transformer_heads"), "model.transformer_heads"
-            ),
+            hidden_dim=hidden_dim,
+            transformer_heads=transformer_heads,
             transformer_layers=_positive_int(
                 model.get("transformer_layers"), "model.transformer_layers"
             ),

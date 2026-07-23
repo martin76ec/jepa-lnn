@@ -34,6 +34,15 @@ def test_load_screen_config_has_explicit_variant_matrix() -> None:
     assert config.experiment.variants == ("lewm_ar", "mlp", "transformer", "cfc", "ltc")
 
 
+def test_load_official_reference_config_is_evaluation_only() -> None:
+    config = load_config(ROOT / "configs" / "h200-lewm-official.yaml")
+
+    assert config.experiment.name == "h200-lewm-official-reference"
+    assert config.experiment.variants == ()
+    assert config.training.max_epochs is None
+    assert config.training.batch_size is None
+
+
 def test_config_rejects_invalid_fraction(tmp_path: Path) -> None:
     config_path = tmp_path / "invalid.yaml"
     config_path.write_text(

@@ -1,7 +1,10 @@
 """Tests for reproducibility metadata persistence."""
 
 import json
+import math
 from pathlib import Path
+
+import pytest
 
 from lewm_liquid_predictors.training import (
     capture_run_provenance,
@@ -19,6 +22,7 @@ def test_initialize_run_persists_config_provenance_and_metrics(tmp_path: Path) -
         seed=7,
         requested_device="cpu",
         git_commit="test-commit",
+        git_dirty=False,
         packages={"torch": "test"},
     )
 
@@ -30,5 +34,11 @@ def test_initialize_run_persists_config_provenance_and_metrics(tmp_path: Path) -
     saved_metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
     assert "frameskip: 5" in resolved_config
     assert saved_provenance["git_commit"] == "test-commit"
+    assert saved_provenance["git_dirty"] is False
     assert saved_provenance["packages"] == {"torch": "test"}
     assert saved_metrics == {"validation/loss": 0.25}
+
+
+def test_metrics_reject_non_standard_non_finite_json(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        write_metrics(tmp_path, {"validation/loss": math.nan})

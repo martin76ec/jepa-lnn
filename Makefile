@@ -6,15 +6,20 @@ LOCAL_CONFIG := configs/local.yaml
 H200_CONFIG := configs/h200.yaml
 H200_PILOT_CONFIG := configs/h200-pilot.yaml
 H200_SCREEN_CONFIG := configs/h200-screen.yaml
+LEWM_OFFICIAL_CONFIG := configs/h200-lewm-official.yaml
+LEWM_MODEL_REPOSITORY := quentinll/lewm-pusht
+LEWM_MODEL_REVISION := 22b330c28c27ead4bfd1888615af1340e3fe9052
+LEWM_CHECKPOINT_DIRECTORY := checkpoints/lewm-pusht
 
 .DEFAULT_GOAL := help
-.PHONY: help sync download-data inspect-data validate-local validate-h200 validate-h200-pilot validate-h200-screen format lint typecheck test check train-local evaluate-local train-lewm-local train-lewm-h200 train-lewm-h200-pilot train-h200-screen clean
+.PHONY: help sync download-data download-lewm-checkpoint inspect-data validate-local validate-h200 validate-h200-pilot validate-h200-screen format lint typecheck test check train-local evaluate-local train-lewm-local train-lewm-h200 train-lewm-h200-pilot train-h200-screen evaluate-lewm-official clean
 
 help:
 	@printf '%s\n' \
 		'Available targets:' \
 		'  sync           Install development, dataset, and upstream dependencies.' \
 		'  download-data  Download or resume the official PushT Lance dataset.' \
+		'  download-lewm-checkpoint Download the pinned official PushT LeWM checkpoint.' \
 		'  inspect-data   Stream one local PushT episode through the adapter.' \
 		'  validate-local Validate the local smoke-test configuration.' \
 		'  validate-h200  Validate the draft H200 configuration.' \
@@ -26,6 +31,7 @@ help:
 		'  train-lewm-h200 Run the full LeWM baseline on H200 (100 epochs, full data).' \
 		'  train-lewm-h200-pilot Run the 10%-data, 10-epoch H200 pilot (not a baseline result).' \
 		'  train-h200-screen Run the three-seed, five-predictor H200 screening study.' \
+		'  evaluate-lewm-official Evaluate the official full LeWM-JEPA checkpoint.' \
 		'  format         Format the repository with Ruff.' \
 		'  lint           Run Ruff lint checks.' \
 		'  typecheck      Run strict mypy checks.' \
@@ -38,6 +44,11 @@ sync:
 
 download-data:
 	$(UV) run --group data hf download $(DATASET_REPOSITORY) --repo-type dataset --local-dir $(DATASET_DIRECTORY) --include "$(DATASET_NAME)/**"
+
+download-lewm-checkpoint:
+	mkdir -p $(LEWM_CHECKPOINT_DIRECTORY)
+	curl -L --fail --continue-at - --output $(LEWM_CHECKPOINT_DIRECTORY)/config.json https://huggingface.co/$(LEWM_MODEL_REPOSITORY)/resolve/$(LEWM_MODEL_REVISION)/config.json
+	curl -L --fail --continue-at - --output $(LEWM_CHECKPOINT_DIRECTORY)/weights.pt https://huggingface.co/$(LEWM_MODEL_REPOSITORY)/resolve/$(LEWM_MODEL_REVISION)/weights.pt
 
 inspect-data:
 	$(UV) run --extra upstream lewm-liquid-predictors inspect-pusht $(DATASET_DIRECTORY)/$(DATASET_NAME) --max-episodes 1
@@ -71,6 +82,9 @@ train-lewm-h200-pilot:
 
 train-h200-screen:
 	STABLEWM_HOME=$(CURDIR)/data/raw HF_HUB_OFFLINE=1 $(UV) run --extra upstream lewm-liquid-predictors screen $(H200_SCREEN_CONFIG)
+
+evaluate-lewm-official:
+	STABLEWM_HOME=$(CURDIR)/data/raw HF_HUB_OFFLINE=1 $(UV) run --extra upstream lewm-liquid-predictors evaluate-lewm-official $(LEWM_OFFICIAL_CONFIG) --checkpoint $(LEWM_CHECKPOINT_DIRECTORY)/weights.pt
 
 format:
 	$(UV) run ruff format .

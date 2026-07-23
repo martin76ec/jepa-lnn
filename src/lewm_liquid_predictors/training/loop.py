@@ -101,7 +101,14 @@ def masked_transition_mse(predictions: Tensor, targets: Tensor, mask: Tensor) ->
     valid_values = expanded_mask.sum() * predictions.shape[-1]
     if valid_values.item() == 0:
         raise ValueError("mask must contain at least one valid transition")
-    return ((predictions - targets).square() * expanded_mask).sum() / valid_values
+    if not torch.isfinite(predictions[mask]).all() or not torch.isfinite(targets[mask]).all():
+        raise ValueError("valid predictions and targets must be finite")
+    squared_error = torch.where(
+        expanded_mask,
+        (predictions - targets).square(),
+        torch.zeros_like(predictions),
+    )
+    return squared_error.sum() / valid_values
 
 
 def _validate_transition_tensors(predictions: Tensor, targets: Tensor, mask: Tensor) -> None:

@@ -25,6 +25,21 @@ class PredictorSystem(nn.Module):
         self.encoder = encoder
         self.action_encoder = action_encoder
         self.predictor = predictor
+        self._shared_modules_frozen = False
+
+    def freeze_shared_modules(self) -> None:
+        """Freeze the encoder and action encoder as a fixed latent representation."""
+        self._shared_modules_frozen = True
+        self.encoder.requires_grad_(False).eval()
+        self.action_encoder.requires_grad_(False).eval()
+
+    def train(self, mode: bool = True) -> PredictorSystem:
+        """Set training mode while preserving frozen shared modules in evaluation mode."""
+        super().train(mode)
+        if self._shared_modules_frozen:
+            self.encoder.eval()
+            self.action_encoder.eval()
+        return self
 
     def encode_batch(self, batch: ObservationTrajectoryBatch) -> TrajectoryBatch:
         """Encode valid pixels/actions without letting padding affect shared modules."""
@@ -39,8 +54,9 @@ class PredictorSystem(nn.Module):
             ),
             dim=1,
         )
-        latents = self._scatter_encoded_states(batch.observations, state_mask)
-        action_embeddings = self._scatter_encoded_actions(batch.actions, batch.transition_mask)
+        with torch.set_grad_enabled(not self._shared_modules_frozen):
+            latents = self._scatter_encoded_states(batch.observations, state_mask)
+            action_embeddings = self._scatter_encoded_actions(batch.actions, batch.transition_mask)
         return TrajectoryBatch(
             episode_ids=batch.episode_ids,
             latents=latents,

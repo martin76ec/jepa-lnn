@@ -6,40 +6,46 @@ import argparse
 import json
 import sys
 from collections.abc import Generator, Iterable, Sequence
+from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import cast
 
-import numpy as np
 import torch
-from numpy.typing import NDArray
 from torch import Tensor, nn
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from lewm_liquid_predictors.data import (
     ObservationTrajectory,
     ObservationTrajectoryBatch,
-    adapt_pusht_episode,
+    ScreeningData,
     collate_observation_trajectories,
+    episode_index,
     load_pusht_lance_episodes,
-    open_pusht_lance_source,
+    materialize_training_windows,
+    prepare_observation_batch,
+    prepare_screening_data,
 )
-from lewm_liquid_predictors.data.preprocessing import (
-    ZScoreNormalizer,
-    fit_zscore_normalizer,
-    preprocess_observations,
-)
+from lewm_liquid_predictors.data.preprocessing import ZScoreNormalizer
 from lewm_liquid_predictors.data.pusht import EpisodeSource
-from lewm_liquid_predictors.data.splits import (
-    create_split_manifest,
-    sample_episode_ids,
-    write_split_manifest,
+from lewm_liquid_predictors.evaluation import (
+    EpisodePredictions,
+    HeldOutEvaluation,
+    evaluate_rollouts,
+    evaluate_screen_split,
+    write_retrieval_galleries,
 )
-from lewm_liquid_predictors.evaluation import divergence_times, evaluate_rollouts
 from lewm_liquid_predictors.models import (
+    LeWMJEPA,
+    LeWMPredictorView,
     build_lewm_baseline,
     build_predictor,
     teacher_forced_rollout,
+)
+from lewm_liquid_predictors.models.checkpoint_adapters import (
+    OFFICIAL_LEWM_PUSHT,
+    load_official_lewm,
 )
 from lewm_liquid_predictors.models.encoder import LeWMEncoder
 from lewm_liquid_predictors.models.protocol import DynamicsPredictor
@@ -81,6 +87,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     evaluate.add_argument("config", type=Path)
     evaluate.add_argument("--data-path", default="data/raw/pusht_expert_train.lance")
     evaluate.add_argument("--max-episodes", type=int, default=None)
+    evaluate.add_argument("--checkpoint", type=Path, default=None)
 
     train_lewm = subparsers.add_parser("train-lewm")
     train_lewm.add_argument("config", type=Path)
@@ -90,6 +97,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
     screen = subparsers.add_parser("screen")
     screen.add_argument("config", type=Path)
     screen.add_argument("--data-path", default="data/raw/pusht_expert_train.lance")
+    screen.add_argument(
+        "--checkpoint", type=Path, default=Path("checkpoints/lewm-pusht/weights.pt")
+    )
+
+    evaluate_lewm = subparsers.add_parser("evaluate-lewm-official")
+    evaluate_lewm.add_argument("config", type=Path)
+    evaluate_lewm.add_argument("--data-path", default="data/raw/pusht_expert_train.lance")
+    evaluate_lewm.add_argument(
+        "--checkpoint", type=Path, default=Path("checkpoints/lewm-pusht/weights.pt")
+    )
+    evaluate_lewm.add_argument("--max-test-episodes", type=int, default=None)
 
     parsed = parser.parse_args(arguments)
     if parsed.command == "validate-config":
@@ -120,6 +138,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _run_evaluate(parsed)
     if parsed.command == "screen":
         return _run_screen(parsed)
+    if parsed.command == "evaluate-lewm-official":
+        return _run_evaluate_lewm_official(parsed)
     return 1
 
 
@@ -129,25 +149,65 @@ def _load_trajectories(
     return load_pusht_lance_episodes(data_path, max_episodes=max_episodes)
 
 
-def _build_system(config: ExperimentConfig, action_input_dim: int) -> PredictorSystem:
+def _build_system(
+    config: ExperimentConfig,
+    action_input_dim: int,
+    shared_lewm: LeWMJEPA | None = None,
+) -> PredictorSystem:
     settings = config.model
     latent_dim = settings.latent_dim
-    predictor = build_predictor(settings)
-    if settings.encoder_mode == "upstream":
-        encoder: LeWMEncoder = build_upstream_encoder(latent_dim=latent_dim)
-        action_encoder: nn.Module = build_upstream_action_encoder(
+    encoder: LeWMEncoder
+    action_encoder: nn.Module
+    if shared_lewm is not None:
+        encoder = deepcopy(shared_lewm.encoder)
+        action_encoder = deepcopy(shared_lewm.action_encoder)
+    elif settings.encoder_mode == "upstream":
+        encoder = build_upstream_encoder(latent_dim=latent_dim)
+        action_encoder = build_upstream_action_encoder(
             action_input_dim, emb_dim=settings.action_dim
         )
     else:
         encoder = build_smoke_encoder(latent_dim)
         action_encoder = SmokeActionEncoder(action_input_dim, settings.action_dim)
-    return PredictorSystem(encoder=encoder, action_encoder=action_encoder, predictor=predictor)
+    system = PredictorSystem(
+        encoder=encoder,
+        action_encoder=action_encoder,
+        predictor=build_predictor(settings),
+    )
+    if shared_lewm is not None:
+        system.freeze_shared_modules()
+    return system
 
 
 def _resolve_device(requested: str) -> torch.device:
     if requested == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(requested)
+
+
+def _prepare_screen_data(config: ExperimentConfig, data_path: str) -> ScreeningData:
+    """Prepare the validated split and exact upstream action statistics."""
+    print("[screen] opening PushT dataset...", file=sys.stderr, flush=True)
+    return prepare_screening_data(
+        data_path,
+        dataset=config.data.dataset,
+        manifest_path=config.experiment.output_dir / "split_manifest.json",
+        split_seed=config.experiment.seeds[0],
+        frameskip=config.data.frameskip,
+        training_fraction=config.data.fraction,
+    )
+
+
+def _load_official_lewm(checkpoint_path: Path, action_input_dim: int) -> tuple[LeWMJEPA, str]:
+    """Load and verify the pinned official PushT LeWM checkpoint on CPU."""
+    try:
+        model = load_official_lewm(checkpoint_path, action_input_dim)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"official LeWM checkpoint not found: {checkpoint_path}; "
+            "run `make download-lewm-checkpoint`"
+        ) from error
+    return model, OFFICIAL_LEWM_PUSHT.sha256
 
 
 def _run_train(parsed: argparse.Namespace) -> int:
@@ -198,11 +258,18 @@ def _run_evaluate(parsed: argparse.Namespace) -> int:
     action_input_dim = trajectories[0].actions.shape[-1]
 
     system = _build_system(config, action_input_dim).to(device)
-    run_dir = config.experiment.output_dir
-    checkpoint_path = Path(run_dir) / "system.pt"
-    if checkpoint_path.exists():
-        system.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        print(f"loaded checkpoint from {checkpoint_path}")
+    checkpoint_path = parsed.checkpoint
+    if checkpoint_path is None:
+        candidates = sorted(config.experiment.output_dir.glob("run_*/system.pt"))
+        if not candidates:
+            raise FileNotFoundError(
+                f"no trained system checkpoint found under {config.experiment.output_dir}"
+            )
+        checkpoint_path = candidates[-1]
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"system checkpoint not found: {checkpoint_path}")
+    system.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
+    print(f"loaded checkpoint from {checkpoint_path}")
     system.eval()
 
     batch = collate_observation_trajectories(trajectories).to(device)
@@ -212,9 +279,14 @@ def _run_evaluate(parsed: argparse.Namespace) -> int:
         latent_batch,
         config.evaluation.rollout_horizons,
         config.evaluation.divergence.normalized_error_threshold,
+        config.evaluation.divergence.count_non_finite_as_divergence,
     )
     result = {
+        "one_step_normalized_mse": metrics.one_step_normalized_mse.item(),
         "one_step_normalized_rmse": metrics.one_step_normalized_rmse.item(),
+        "rollout_normalized_mse": {
+            str(horizon): error.item() for horizon, error in metrics.rollout_normalized_mse.items()
+        },
         "rollout_normalized_rmse": {
             str(horizon): error.item() for horizon, error in metrics.rollout_normalized_rmse.items()
         },
@@ -226,60 +298,26 @@ def _run_evaluate(parsed: argparse.Namespace) -> int:
 
 def _run_screen(parsed: argparse.Namespace) -> int:
     """Run the fixed-budget, held-out predictor comparison on H200."""
-    from torch.utils.data import DataLoader, Dataset
-
     config = load_config(parsed.config)
     if config.model.encoder_mode != "upstream":
         raise ValueError("screen requires model.encoder_mode: upstream")
     if not config.experiment.variants:
         raise ValueError("screen requires experiment.variants")
+    torch.use_deterministic_algorithms(config.training.deterministic)
     print(f"[screen] config: {parsed.config}", file=sys.stderr, flush=True)
-    print("[screen] opening PushT dataset...", file=sys.stderr, flush=True)
-    source = open_pusht_lance_source(parsed.data_path, config.data.frameskip)
-    episode_ids = tuple(f"episode-{index:06d}" for index in range(len(source.lengths)))
-    manifest = create_split_manifest(
-        config.data.dataset, episode_ids, seed=config.experiment.seeds[0]
+    screen_data = _prepare_screen_data(config, parsed.data_path)
+    train_dataset = materialize_training_windows(
+        screen_data, config.model.transformer_context_length + 1
+    )
+    test_indices = tuple(episode_index(episode_id) for episode_id in screen_data.test_episode_ids)
+    shared_lewm, checkpoint_digest = _load_official_lewm(
+        parsed.checkpoint, screen_data.action_input_dim
     )
     output_root = config.experiment.output_dir
-    output_root.mkdir(parents=True, exist_ok=True)
-    write_split_manifest(manifest, output_root / "split_manifest.json")
-    train_ids = sample_episode_ids(manifest.train, config.data.fraction, manifest.seed)
-    train_trajectories = tuple(
-        _load_source_episode(source, _episode_index(episode_id), config.data.frameskip)
-        for episode_id in train_ids
-    )
-    test_indices = tuple(_episode_index(episode_id) for episode_id in manifest.test)
-    action_normalizer = fit_zscore_normalizer(
-        torch.cat([item.actions for item in train_trajectories])
-    )
-    action_input_dim = train_trajectories[0].actions.shape[-1]
-    window_size = config.model.transformer_context_length + 1
-
-    class WindowDataset(Dataset[ObservationTrajectory]):
-        def __init__(self, items: tuple[ObservationTrajectory, ...]) -> None:
-            self.windows = tuple(
-                (item, start)
-                for item in items
-                for start in range(item.actions.shape[0] - window_size + 2)
-            )
-            if not self.windows:
-                raise ValueError("training trajectories are shorter than the context window")
-
-        def __len__(self) -> int:
-            return len(self.windows)
-
-        def __getitem__(self, index: int) -> ObservationTrajectory:
-            trajectory, start = self.windows[index]
-            return ObservationTrajectory(
-                episode_id=trajectory.episode_id,
-                observations=trajectory.observations[start : start + window_size],
-                actions=trajectory.actions[start : start + window_size - 1],
-            )
-
-    train_dataset = WindowDataset(train_trajectories)
     print(
-        f"[screen] episodes: train={len(train_trajectories)}, test={len(test_indices)}; "
-        f"train_windows={len(train_dataset)}; variants={','.join(config.experiment.variants)}",
+        f"[screen] episodes: train={len(screen_data.train_episode_ids)}, "
+        f"test={len(test_indices)}; train_windows={len(train_dataset)}; "
+        f"variants={','.join(config.experiment.variants)}; shared_encoder=frozen-official",
         file=sys.stderr,
         flush=True,
     )
@@ -297,8 +335,14 @@ def _run_screen(parsed: argparse.Namespace) -> int:
                 ),
                 model=replace(config.model, variant=variant),
             )
-            system = _build_system(run_config, action_input_dim).to(device)
-            optimizer = torch.optim.AdamW(system.parameters(), lr=5e-5, weight_decay=1e-3)
+            system = _build_system(
+                run_config, screen_data.action_input_dim, shared_lewm=shared_lewm
+            ).to(device)
+            optimizer = torch.optim.AdamW(
+                (parameter for parameter in system.parameters() if parameter.requires_grad),
+                lr=5e-5,
+                weight_decay=1e-3,
+            )
             epochs = run_config.training.max_epochs or 1
             scheduler = build_linear_warmup_cosine_scheduler(
                 optimizer, max(1, int(0.01 * epochs)), epochs
@@ -308,6 +352,12 @@ def _run_screen(parsed: argparse.Namespace) -> int:
                 run_config.experiment.output_dir,
                 run_config,
                 capture_run_provenance(seed=seed, requested_device=run_config.training.device),
+            )
+            _write_data_protocol(
+                run_dir,
+                screen_data,
+                checkpoint_digest=checkpoint_digest,
+                evaluation_scope="transductive_fixed_official_latent_space",
             )
             print(
                 f"[screen] variant={variant}, seed={seed}, run={run_dir}",
@@ -329,7 +379,8 @@ def _run_screen(parsed: argparse.Namespace) -> int:
                     collate_fn=collate_observation_trajectories,
                 )
                 metrics = trainer.train_observation_epoch(
-                    _prepared_batches(loader, action_normalizer, device), total_batches=len(loader)
+                    _prepared_batches(loader, screen_data.action_normalizer, device),
+                    total_batches=len(loader),
                 )
                 history.append(
                     {
@@ -347,24 +398,208 @@ def _run_screen(parsed: argparse.Namespace) -> int:
                     flush=True,
                 )
             print("[screen] evaluating held-out test episodes...", file=sys.stderr, flush=True)
-            test_metrics = _evaluate_screen(
+            evaluation = _evaluate_screen(
                 system,
-                source,
+                screen_data.source,
                 test_indices,
-                action_normalizer,
+                screen_data.action_normalizer,
                 run_config,
                 device,
-                run_dir,
             )
             parameter_count = sum(parameter.numel() for parameter in system.predictor.parameters())
-            result = {**history[-1], **test_metrics, "predictor/parameters": float(parameter_count)}
+            result = {
+                **history[-1],
+                **evaluation.metrics,
+                "predictor/parameters": float(parameter_count),
+            }
             write_metrics(run_dir, result)
             (run_dir / "history.json").write_text(
                 json.dumps(history, indent=2) + "\n", encoding="utf-8"
             )
             torch.save(system.state_dict(), run_dir / "system.pt")
+            _render_retrieval_artifacts(run_dir, evaluation, screen_data.source, run_config)
             print(json.dumps({"variant": variant, "seed": seed, **result}, sort_keys=True))
     return 0
+
+
+def _run_evaluate_lewm_official(parsed: argparse.Namespace) -> int:
+    """Evaluate the released LeWM-JEPA checkpoint as an in-dataset reference."""
+    config = load_config(parsed.config)
+    checkpoint_path = parsed.checkpoint
+    print(f"[lewm-official] config: {parsed.config}", file=sys.stderr, flush=True)
+    screen_data = _prepare_screen_data(config, parsed.data_path)
+    if parsed.max_test_episodes is not None and parsed.max_test_episodes <= 0:
+        raise ValueError("--max-test-episodes must be positive")
+    test_indices = tuple(episode_index(episode_id) for episode_id in screen_data.test_episode_ids)[
+        : parsed.max_test_episodes
+    ]
+    device = _resolve_device(config.training.device)
+    model, checkpoint_digest = _load_official_lewm(checkpoint_path, screen_data.action_input_dim)
+    model = model.to(device)
+
+    split_seed = screen_data.manifest.seed
+    run_config = replace(
+        config,
+        experiment=replace(
+            config.experiment,
+            name="h200-screen-lewm-official",
+            output_dir=config.experiment.output_dir / "lewm_full",
+            seeds=(split_seed,),
+        ),
+    )
+    run_dir = initialize_run(
+        run_config.experiment.output_dir,
+        run_config,
+        capture_run_provenance(seed=split_seed, requested_device=run_config.training.device),
+    )
+    _write_data_protocol(
+        run_dir,
+        screen_data,
+        checkpoint_digest=checkpoint_digest,
+        evaluation_scope="in_dataset_pretrained_reference",
+        max_test_episodes=parsed.max_test_episodes,
+    )
+    print(
+        f"[lewm-official] checkpoint loaded; evaluating {len(test_indices)} "
+        f"screen-split episodes as an in-dataset reference; run={run_dir}",
+        file=sys.stderr,
+        flush=True,
+    )
+    evaluation = _evaluate_lewm_model(
+        model,
+        screen_data.source,
+        test_indices,
+        screen_data.action_normalizer,
+        run_config,
+        device,
+    )
+    metrics = evaluation.metrics
+    metrics["model/parameters"] = float(sum(parameter.numel() for parameter in model.parameters()))
+    metrics["predictor/parameters"] = float(
+        sum(parameter.numel() for parameter in model.predictor.parameters())
+        + sum(parameter.numel() for parameter in model.pred_proj.parameters())
+    )
+    write_metrics(run_dir, metrics)
+    checkpoint_metadata = {
+        "repository": OFFICIAL_LEWM_PUSHT.repository,
+        "revision": OFFICIAL_LEWM_PUSHT.revision,
+        "sha256": checkpoint_digest,
+        "upstream_training_seed": OFFICIAL_LEWM_PUSHT.training_seed,
+        "screen_split_seed": split_seed,
+        "objective": "pred_loss + 0.09 * sigreg_loss",
+    }
+    (run_dir / "checkpoint.json").write_text(
+        json.dumps(checkpoint_metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _render_retrieval_artifacts(run_dir, evaluation, screen_data.source, run_config)
+    print(json.dumps({"variant": "lewm_full", **metrics}, sort_keys=True))
+    return 0
+
+
+@torch.no_grad()
+def _evaluate_lewm_model(
+    model: LeWMJEPA,
+    source: EpisodeSource,
+    test_indices: tuple[int, ...],
+    action_normalizer: ZScoreNormalizer,
+    config: ExperimentConfig,
+    device: torch.device,
+) -> HeldOutEvaluation:
+    """Evaluate the exact LeWM prediction branch with shared held-out metrics."""
+    model.eval()
+    predictor = LeWMPredictorView(model)
+    dynamics_predictor = cast(DynamicsPredictor, predictor)
+
+    def predict_episode(prepared: ObservationTrajectoryBatch) -> EpisodePredictions:
+        encoded = model.encode({"pixels": prepared.observations, "action": prepared.actions})
+        latents = encoded["emb"]
+        action_embeddings = encoded["act_emb"]
+        teacher_forced = teacher_forced_rollout(dynamics_predictor, latents, action_embeddings)
+        rollout, _ = predictor.rollout(
+            latents[:, 0],
+            action_embeddings,
+        )
+        return EpisodePredictions(latents, teacher_forced, rollout)
+
+    return evaluate_screen_split(
+        source,
+        test_indices,
+        action_normalizer,
+        frameskip=config.data.frameskip,
+        horizons=config.evaluation.rollout_horizons,
+        divergence_threshold=config.evaluation.divergence.normalized_error_threshold,
+        count_non_finite_as_divergence=(
+            config.evaluation.divergence.count_non_finite_as_divergence
+        ),
+        device=device,
+        predict_episode=predict_episode,
+    )
+
+
+def _write_data_protocol(
+    run_dir: Path,
+    data: ScreeningData,
+    *,
+    checkpoint_digest: str,
+    evaluation_scope: str,
+    max_test_episodes: int | None = None,
+) -> None:
+    """Persist split, normalization, checkpoint, and runtime evaluation identity."""
+    (run_dir / "split_manifest.json").write_text(
+        data.manifest_path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    metadata = {
+        "dataset": data.manifest.dataset,
+        "dataset_source": data.dataset_source,
+        "dataset_fingerprint": data.dataset_fingerprint,
+        "split_seed": data.manifest.seed,
+        "split_manifest_sha256": data.manifest_digest,
+        "selected_train_episode_count": len(data.train_episode_ids),
+        "test_episode_count": len(data.test_episode_ids),
+        "max_test_episodes": max_test_episodes,
+        "action_normalization": {
+            "policy": "full_raw_action_column_before_frameskip",
+            "sample_count": data.action_statistics.sample_count,
+            "raw_mean": data.action_statistics.mean.tolist(),
+            "raw_std": data.action_statistics.std.tolist(),
+        },
+        "shared_encoder": {
+            "repository": OFFICIAL_LEWM_PUSHT.repository,
+            "revision": OFFICIAL_LEWM_PUSHT.revision,
+            "checkpoint_sha256": checkpoint_digest,
+            "config_sha256": OFFICIAL_LEWM_PUSHT.config_sha256,
+            "frozen": True,
+        },
+        "evaluation_scope": evaluation_scope,
+    }
+    (run_dir / "data_protocol.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def _render_retrieval_artifacts(
+    run_dir: Path,
+    evaluation: HeldOutEvaluation,
+    source: EpisodeSource,
+    config: ExperimentConfig,
+) -> None:
+    """Render optional retrieval artifacts after scientific metrics are durable."""
+    try:
+        write_retrieval_galleries(
+            run_dir,
+            evaluation.gallery_queries,
+            evaluation.retrieval_latents,
+            evaluation.retrieval_references,
+            source,
+            config.data.frameskip,
+            config.evaluation.rollout_horizons,
+        )
+    except (ImportError, OSError, ValueError) as error:
+        (run_dir / "retrieval_error.json").write_text(
+            json.dumps({"error": str(error)}, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"[evaluation] retrieval rendering failed: {error}", file=sys.stderr, flush=True)
 
 
 def _prepared_batches(
@@ -374,23 +609,7 @@ def _prepared_batches(
 ) -> Generator[ObservationTrajectoryBatch, None, None]:
     """Apply common CPU preprocessing before moving a batch to the accelerator."""
     for batch in batches:
-        observations = _channels_first(batch.observations)
-        prepared = ObservationTrajectoryBatch(
-            episode_ids=batch.episode_ids,
-            observations=preprocess_observations(observations),
-            actions=torch.nan_to_num(action_normalizer(batch.actions), 0.0),
-            transition_mask=batch.transition_mask,
-        )
-        yield prepared.to(device)
-
-
-def _channels_first(observations: Tensor) -> Tensor:
-    """Accept either CHW or HWC source pixels while enforcing the encoder layout."""
-    if observations.shape[-3] == 3:
-        return observations
-    if observations.shape[-1] == 3:
-        return observations.movedim(-1, -3)
-    raise ValueError("pixels must be RGB in CHW or HWC layout")
+        yield prepare_observation_batch(batch, action_normalizer, device)
 
 
 @torch.no_grad()
@@ -401,186 +620,31 @@ def _evaluate_screen(
     action_normalizer: ZScoreNormalizer,
     config: ExperimentConfig,
     device: torch.device,
-    run_dir: Path,
-) -> dict[str, float]:
+) -> HeldOutEvaluation:
     """Aggregate held-out normalized errors over complete episodes."""
     system.eval()
     predictor = cast(DynamicsPredictor, system.predictor)
-    horizons = config.evaluation.rollout_horizons
-    error_sums = {"one_step": 0.0, **{str(horizon): 0.0 for horizon in horizons}}
-    target_sums = {key: 0.0 for key in error_sums}
-    divergences = 0
-    episodes = 0
-    retrieval_latents: list[Tensor] = []
-    retrieval_references: list[tuple[int, int]] = []
-    gallery_queries: list[tuple[ObservationTrajectory, Tensor]] = []
-    for episode_index in test_indices:
-        trajectory = _load_source_episode(source, episode_index, config.data.frameskip)
-        batch = collate_observation_trajectories([trajectory])
-        prepared = next(_prepared_batches(iter([batch]), action_normalizer, device))
+
+    def predict_episode(prepared: ObservationTrajectoryBatch) -> EpisodePredictions:
         latent_batch = system.encode_batch(prepared)
-        targets = latent_batch.latents[:, 1:]
         teacher_forced = teacher_forced_rollout(
             predictor, latent_batch.latents, latent_batch.actions
         )
         rollout, _ = predictor.rollout(latent_batch.latents[:, 0], latent_batch.actions)
-        retrieval_latents.append(latent_batch.latents[0].detach().cpu())
-        retrieval_references.extend(
-            (episode_index, timestep) for timestep in range(latent_batch.latents.shape[1])
-        )
-        if len(gallery_queries) < 3:
-            gallery_queries.append((trajectory, rollout[0].detach().cpu()))
-        _accumulate_error(
-            error_sums,
-            target_sums,
-            "one_step",
-            teacher_forced,
-            targets,
-            latent_batch.transition_mask,
-        )
-        for horizon in horizons:
-            if horizon <= rollout.shape[1]:
-                _accumulate_error(
-                    error_sums,
-                    target_sums,
-                    str(horizon),
-                    rollout[:, horizon - 1 : horizon],
-                    targets[:, horizon - 1 : horizon],
-                    latent_batch.transition_mask[:, horizon - 1 : horizon],
-                )
-        divergence = divergence_times(
-            rollout,
-            targets,
-            latent_batch.transition_mask,
-            config.evaluation.divergence.normalized_error_threshold,
-        )
-        divergences += int((divergence >= 0).sum().item())
-        episodes += 1
-    metrics = {
-        "test/one_step_normalized_rmse": _normalized_error(
-            error_sums["one_step"], target_sums["one_step"]
-        ),
-        "test/divergence_rate": divergences / episodes,
-    }
-    metrics.update(
-        {
-            f"test/rollout_normalized_rmse/{horizon}": _normalized_error(
-                error_sums[str(horizon)], target_sums[str(horizon)]
-            )
-            for horizon in horizons
-            if target_sums[str(horizon)] > 0
-        }
-    )
-    _write_retrieval_galleries(
-        run_dir,
-        gallery_queries,
-        torch.cat(retrieval_latents),
-        retrieval_references,
+        return EpisodePredictions(latent_batch.latents, teacher_forced, rollout)
+
+    return evaluate_screen_split(
         source,
-        config.data.frameskip,
-        horizons,
-    )
-    return metrics
-
-
-def _accumulate_error(
-    error_sums: dict[str, float],
-    target_sums: dict[str, float],
-    key: str,
-    predictions: Tensor,
-    targets: Tensor,
-    mask: Tensor,
-) -> None:
-    expanded_mask = mask.unsqueeze(-1)
-    error_sums[key] += float(((predictions - targets).square() * expanded_mask).sum().item())
-    target_sums[key] += float((targets.square() * expanded_mask).sum().item())
-
-
-def _normalized_error(error_sum: float, target_sum: float) -> float:
-    if target_sum <= 0:
-        raise ValueError("held-out data has no valid target energy")
-    return float((error_sum / target_sum) ** 0.5)
-
-
-def _write_retrieval_galleries(
-    run_dir: Path,
-    queries: list[tuple[ObservationTrajectory, Tensor]],
-    reference_latents: Tensor,
-    references: list[tuple[int, int]],
-    source: EpisodeSource,
-    frameskip: int,
-    horizons: tuple[int, ...],
-) -> None:
-    """Save nearest-test-frame galleries as a visual latent-space diagnostic."""
-    import imageio.v3 as imageio
-
-    if reference_latents.shape[0] != len(references):
-        raise ValueError("retrieval latents and references must align")
-    records: list[dict[str, object]] = []
-    for trajectory, rollout in queries:
-        tiles: list[NDArray[np.uint8]] = []
-        for horizon in horizons:
-            if horizon > rollout.shape[0]:
-                continue
-            predicted = rollout[horizon - 1]
-            distances = (reference_latents - predicted).square().mean(dim=1)
-            index = int(distances.argmin().item())
-            reference_index, reference_timestep = references[index]
-            reference = _load_source_episode(source, reference_index, frameskip)
-            actual = _image_array(trajectory.observations[horizon])
-            retrieved = _image_array(reference.observations[reference_timestep])
-            tiles.append(np.concatenate((actual, retrieved), axis=1))
-            records.append(
-                {
-                    "query_episode_id": trajectory.episode_id,
-                    "horizon": horizon,
-                    "actual_timestep": horizon,
-                    "retrieved_episode_id": reference.episode_id,
-                    "retrieved_timestep": reference_timestep,
-                    "mean_squared_latent_distance": float(distances[index].item()),
-                }
-            )
-        if tiles:
-            imageio.imwrite(
-                run_dir / f"retrieval_{trajectory.episode_id}.png", np.concatenate(tiles, axis=0)
-            )
-    (run_dir / "retrieval.json").write_text(
-        json.dumps(
-            {
-                "description": "Each row pairs actual future frame (left) with nearest "
-                "held-out test-frame latent to the predicted rollout latent (right). "
-                "Retrieved frames are a proxy, not generated images.",
-                "records": records,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-
-def _image_array(observation: Tensor) -> NDArray[np.uint8]:
-    """Convert a source RGB observation to an HWC uint8 image for diagnostics."""
-    image = _channels_first(observation.unsqueeze(0)).squeeze(0)
-    if image.dtype != torch.uint8:
-        image = (image.clamp(0, 1) * 255).to(torch.uint8)
-    return np.asarray(image.permute(1, 2, 0).cpu(), dtype=np.uint8)
-
-
-def _episode_index(episode_id: str) -> int:
-    """Parse the stable episode identifier emitted by the adapter."""
-    prefix = "episode-"
-    if not episode_id.startswith(prefix):
-        raise ValueError(f"invalid episode ID: {episode_id}")
-    return int(episode_id.removeprefix(prefix))
-
-
-def _load_source_episode(
-    source: EpisodeSource, episode_index: int, frameskip: int
-) -> ObservationTrajectory:
-    """Materialize exactly one complete episode from the open Lance source."""
-    return adapt_pusht_episode(
-        f"episode-{episode_index:06d}", source.load_episode(episode_index), frameskip
+        test_indices,
+        action_normalizer,
+        frameskip=config.data.frameskip,
+        horizons=config.evaluation.rollout_horizons,
+        divergence_threshold=config.evaluation.divergence.normalized_error_threshold,
+        count_non_finite_as_divergence=(
+            config.evaluation.divergence.count_non_finite_as_divergence
+        ),
+        device=device,
+        predict_episode=predict_episode,
     )
 
 

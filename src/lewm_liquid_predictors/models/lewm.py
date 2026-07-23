@@ -418,6 +418,59 @@ class LeWMJEPA(nn.Module):
         return output
 
 
+class LeWMPredictorView:
+    """Non-owning shared predictor API over a complete LeWM-JEPA model."""
+
+    def __init__(self, model: LeWMJEPA) -> None:
+        self.model = model
+        self.history_size = model.history_size
+
+    def init_state(self, batch_size: int, device: str) -> LeWMARState:
+        """Create an empty latent/action history for official-model evaluation."""
+        latent_dim = self.model.predictor.pos_embedding.shape[-1]
+        action_dim = latent_dim
+        return LeWMARState(
+            latents=torch.empty(batch_size, 0, latent_dim, device=device),
+            actions=torch.empty(batch_size, 0, action_dim, device=device),
+        )
+
+    def step(
+        self,
+        latent: Tensor,
+        action: Tensor,
+        state: LeWMARState | None,
+        dt: Tensor | None,
+    ) -> tuple[Tensor, LeWMARState]:
+        """Predict one latent through the loaded model's predictor and projection head."""
+        del dt
+        if state is None:
+            state = self.init_state(latent.shape[0], str(latent.device))
+        latents = torch.cat((state.latents, latent.unsqueeze(1)), dim=1)[:, -self.history_size :]
+        actions = torch.cat((state.actions, action.unsqueeze(1)), dim=1)[:, -self.history_size :]
+        prediction = self.model.predict(latents, actions)[:, -1]
+        return prediction, LeWMARState(latents=latents, actions=actions)
+
+    def rollout(
+        self,
+        initial_latent: Tensor,
+        actions: Tensor,
+        state: LeWMARState | None = None,
+        dt: Tensor | None = None,
+    ) -> tuple[Tensor, LeWMARState]:
+        """Roll out the loaded original predictor autoregressively."""
+        predictions: list[Tensor] = []
+        latent = initial_latent
+        for index, action in enumerate(actions.unbind(dim=1)):
+            step_dt = dt if dt is None or dt.ndim < 2 else dt[:, index]
+            latent, state = self.step(latent, action, state, step_dt)
+            predictions.append(latent)
+        if not predictions:
+            raise ValueError("actions must contain at least one timestep")
+        if state is None:
+            raise RuntimeError("LeWM predictor state was not initialized")
+        return torch.stack(predictions, dim=1), state
+
+
 def build_lewm_baseline(
     latent_dim: int = 192,
     action_dim: int = 10,

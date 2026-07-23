@@ -80,3 +80,35 @@ def test_system_trainer_updates_shared_and_predictor_parameters() -> None:
         not torch.equal(previous, current)
         for previous, current in zip(before, system.parameters(), strict=True)
     )
+
+
+def test_frozen_shared_modules_stay_fixed_and_in_evaluation_mode() -> None:
+    system = _system(_VisionEncoder())
+    system.freeze_shared_modules()
+    shared_before = [
+        parameter.detach().clone()
+        for module in (system.encoder, system.action_encoder)
+        for parameter in module.parameters()
+    ]
+    predictor_before = [parameter.detach().clone() for parameter in system.predictor.parameters()]
+    trainable = [parameter for parameter in system.parameters() if parameter.requires_grad]
+
+    PredictorTrainer(system, torch.optim.SGD(trainable, lr=0.01)).train_observation_epoch(
+        [_observation_batch()]
+    )
+
+    shared_after = [
+        parameter
+        for module in (system.encoder, system.action_encoder)
+        for parameter in module.parameters()
+    ]
+    assert all(
+        torch.equal(before, after)
+        for before, after in zip(shared_before, shared_after, strict=True)
+    )
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(predictor_before, system.predictor.parameters(), strict=True)
+    )
+    assert not system.encoder.training
+    assert not system.action_encoder.training

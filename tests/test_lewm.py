@@ -1,11 +1,19 @@
 """Tests for the LeWM baseline reproduction."""
 
 from importlib.util import find_spec
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from lewm_liquid_predictors.models import ARPredictor, LeWMARPredictor, SIGReg, build_lewm_baseline
+from lewm_liquid_predictors.models import (
+    ARPredictor,
+    LeWMARPredictor,
+    LeWMPredictorView,
+    SIGReg,
+    build_lewm_baseline,
+    teacher_forced_rollout,
+)
 
 upstream_required = pytest.mark.skipif(
     find_spec("transformers") is None, reason="requires transformers (upstream extra)"
@@ -92,6 +100,26 @@ def test_lewm_ar_adapter_rollout_matches_repeated_steps() -> None:
             repeated.append(latent)
 
     assert torch.allclose(rollout, torch.stack(repeated, dim=1), atol=1e-6)
+
+
+class _AdditiveLeWM:
+    history_size = 2
+    predictor = SimpleNamespace(pos_embedding=torch.zeros(1, 2, 1))
+
+    def predict(self, latents: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        return latents + actions
+
+
+def test_non_owning_lewm_view_distinguishes_teacher_forcing_from_rollout() -> None:
+    view = LeWMPredictorView(_AdditiveLeWM())  # type: ignore[arg-type]
+    observed_latents = torch.tensor([[[1.0], [100.0], [1000.0]]])
+    actions = torch.tensor([[[2.0], [3.0]]])
+
+    teacher_forced = teacher_forced_rollout(view, observed_latents, actions)
+    rollout, _ = view.rollout(observed_latents[:, 0], actions)
+
+    assert torch.equal(teacher_forced, torch.tensor([[[3.0], [103.0]]]))
+    assert torch.equal(rollout, torch.tensor([[[3.0], [6.0]]]))
 
 
 @upstream_required

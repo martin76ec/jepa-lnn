@@ -105,10 +105,17 @@ def load_pusht_lance_episodes(
     return adapt_pusht_episodes(source, frameskip, max_episodes=max_episodes)
 
 
-def open_pusht_lance_source(path: str | Path, frameskip: int = 5) -> EpisodeSource:
-    """Open the upstream dataset without materializing its episode tensors."""
+def open_pusht_lance_source(
+    path: str | Path,
+    frameskip: int = 5,
+    *,
+    keys_to_load: Sequence[str] = ("pixels", "action"),
+) -> EpisodeSource:
+    """Open selected upstream columns without materializing episode tensors."""
     if frameskip <= 0:
         raise ValueError("frameskip must be positive")
+    if not keys_to_load or not all(keys_to_load) or len(set(keys_to_load)) != len(keys_to_load):
+        raise ValueError("keys_to_load must contain unique, non-empty keys")
     try:
         stable_worldmodel: Any = import_module("stable_worldmodel")
     except ModuleNotFoundError as error:
@@ -124,7 +131,7 @@ def open_pusht_lance_source(path: str | Path, frameskip: int = 5) -> EpisodeSour
             dataset_path,
             frameskip=frameskip,
             num_steps=1,
-            keys_to_load=["pixels", "action"],
+            keys_to_load=list(keys_to_load),
         ),
     )
 
@@ -161,13 +168,13 @@ def adapt_pusht_episode(
     if raw_actions.ndim < 2:
         raise ValueError("action must have shape (raw_timesteps, action_dim)")
     action_blocks = _action_blocks(raw_actions, frameskip)
-    usable_observations = min(observations.shape[0], action_blocks.shape[0])
-    if usable_observations < 2:
+    usable_transitions = min(observations.shape[0] - 1, action_blocks.shape[0])
+    if usable_transitions < 1:
         raise ValueError("episode has fewer than two aligned observations")
     return ObservationTrajectory(
         episode_id=episode_id,
-        observations=observations[:usable_observations],
-        actions=action_blocks[: usable_observations - 1],
+        observations=observations[: usable_transitions + 1],
+        actions=action_blocks[:usable_transitions],
     )
 
 

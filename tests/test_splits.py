@@ -55,3 +55,18 @@ def test_manifest_rejects_changed_source_episode_ids() -> None:
 
     with pytest.raises(ValueError, match="does not match"):
         manifest.validate_episode_ids(["one", "two", "four"])
+
+
+@pytest.mark.parametrize(
+    ("dataset", "seed", "message"),
+    [
+        ("different_dataset", 7, "dataset"),
+        ("pusht_expert_train", 8, "seed"),
+    ],
+)
+def test_manifest_rejects_changed_identity(dataset: str, seed: int, message: str) -> None:
+    episode_ids = ["one", "two", "three"]
+    manifest = create_split_manifest("pusht_expert_train", episode_ids, 7)
+
+    with pytest.raises(ValueError, match=message):
+        manifest.validate(dataset, seed, episode_ids)

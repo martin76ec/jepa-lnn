@@ -39,6 +39,23 @@ class _ZeroPredictor(_AddActionPredictor):
         return torch.zeros_like(latent), None
 
 
+class _StateRequiredPredictor(_AddActionPredictor):
+    def init_state(self, batch_size: int, device: str) -> PredictorState:
+        del device
+        return torch.zeros(batch_size, 1)
+
+    def rollout(
+        self,
+        initial_latent: Tensor,
+        actions: Tensor,
+        state: PredictorState = None,
+        dt: Tensor | None = None,
+    ) -> tuple[Tensor, PredictorState]:
+        if not isinstance(state, Tensor):
+            raise ValueError("rollout requires explicitly initialized state")
+        return super().rollout(initial_latent, actions, state, dt)
+
+
 def _batch() -> object:
     first = Trajectory(
         "first",
@@ -73,3 +90,9 @@ def test_divergence_uses_first_valid_closed_loop_horizon() -> None:
 
     assert torch.equal(metrics.divergence_time, torch.tensor([1, 1]))
     assert metrics.divergence_rate.item() == 1
+
+
+def test_evaluate_rollouts_initializes_closed_loop_predictor_state() -> None:
+    metrics = evaluate_rollouts(_StateRequiredPredictor(), _batch(), (1,), 0.5)
+
+    assert metrics.one_step_normalized_mse.item() == 0.0

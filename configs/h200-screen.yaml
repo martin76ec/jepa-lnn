@@ -1,5 +1,5 @@
 experiment:
-  name: h200-screen
+  name: h200-screen-frozen-official-v2
   seeds: [7, 19, 43]
   variants: [lewm_ar, mlp, transformer, cfc, ltc]
   output_dir: runs/h200-screen
@@ -36,4 +36,6 @@ evaluation:
     count_non_finite_as_divergence: true
 
 # Screening protocol only: all five predictors share this fixed budget and split.
-# It is not an exact reproduction of the full LeWM-JEPA objective or protocol.
+# All candidates use the same frozen official LeWM encoder and action encoder.
+# The fixed representation was pretrained on this dataset, so this is a transductive
+# predictor comparison, not held-out representation generalization.

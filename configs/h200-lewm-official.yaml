@@ -1,0 +1,37 @@
+experiment:
+  name: h200-lewm-official-reference
+  seed: 7
+  output_dir: runs/h200-screen
+
+data:
+  dataset: pusht_expert_train.lance
+  frameskip: 5
+  fraction: 1.0
+  num_workers: 0
+  splits: [train, validation, test]
+
+training:
+  device: cuda
+  max_epochs: null
+  batch_size: null
+  deterministic: true
+
+model:
+  # The evaluator loads the complete official JEPA; this identifies its AR branch.
+  variant: lewm_ar
+  encoder_mode: upstream
+  latent_dim: 192
+  action_dim: 192
+  hidden_dim: 192
+  transformer_heads: 16
+  transformer_layers: 6
+  transformer_context_length: 3
+
+evaluation:
+  rollout_horizons: [1, 5, 10, 20, 50]
+  divergence:
+    normalized_error_threshold: 10.0
+    count_non_finite_as_divergence: true
+
+# The released checkpoint was trained on random windows from this same dataset.
+# Results are an in-dataset pretrained reference, not held-out generalization.

@@ -23,8 +23,8 @@ def _batch() -> object:
 
 
 def test_masked_transition_mse_ignores_padded_values() -> None:
-    predictions = torch.tensor([[[1.0], [999.0]]])
-    targets = torch.tensor([[[0.0], [0.0]]])
+    predictions = torch.tensor([[[1.0], [float("nan")]]])
+    targets = torch.tensor([[[0.0], [float("nan")]]])
     mask = torch.tensor([[True, False]])
 
     assert masked_transition_mse(predictions, targets, mask).item() == pytest.approx(1.0)

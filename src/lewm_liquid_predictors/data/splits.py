@@ -57,6 +57,18 @@ class SplitManifest:
         if set(manifest_ids) != set(source_ids):
             raise ValueError("split manifest does not match the supplied source episodes")
 
+    def validate(self, dataset: str, seed: int, episode_ids: Iterable[str]) -> None:
+        """Require the manifest identity and episode universe to match a request."""
+        if self.dataset != dataset:
+            raise ValueError(
+                f"split manifest dataset {self.dataset!r} does not match requested {dataset!r}"
+            )
+        if self.seed != seed:
+            raise ValueError(
+                f"split manifest seed {self.seed} does not match requested seed {seed}"
+            )
+        self.validate_episode_ids(episode_ids)
+
 
 def create_split_manifest(
     dataset: str,

@@ -11,6 +11,7 @@ from lewm_liquid_predictors.data import (
     adapt_pusht_episode,
     adapt_pusht_episodes,
     collate_observation_trajectories,
+    pusht,
 )
 
 
@@ -24,6 +25,32 @@ class _Source:
 
     def load_episode(self, episode_idx: int) -> Mapping[str, Tensor]:
         return self._episodes[episode_idx]
+
+
+def test_lance_source_forwards_explicit_keys_without_loading_data(monkeypatch: object) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    expected_source = object()
+
+    class _Data:
+        @staticmethod
+        def load_dataset(path: str, **kwargs: object) -> object:
+            calls.append((path, kwargs))
+            return expected_source
+
+    class _StableWorldModel:
+        data = _Data()
+
+    monkeypatch.setattr(pusht, "import_module", lambda name: _StableWorldModel())  # type: ignore[attr-defined]
+
+    source = pusht.open_pusht_lance_source("hf://pusht", frameskip=3, keys_to_load=("action",))
+
+    assert source is expected_source
+    assert calls == [
+        (
+            "hf://pusht",
+            {"frameskip": 3, "num_steps": 1, "keys_to_load": ["action"]},
+        )
+    ]
 
 
 def test_adapter_flattens_raw_action_blocks_and_drops_terminal_action_block() -> None:
@@ -40,6 +67,18 @@ def test_adapter_flattens_raw_action_blocks_and_drops_terminal_action_block() ->
         trajectory.actions,
         torch.tensor([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]),
     )
+
+
+def test_adapter_keeps_all_blocks_when_source_has_one_more_observation() -> None:
+    episode = {
+        "pixels": torch.zeros(4, 2, 2, 3, dtype=torch.uint8),
+        "action": torch.arange(6, dtype=torch.float32).reshape(6, 1),
+    }
+
+    trajectory = adapt_pusht_episode("episode-0", episode, frameskip=2)
+
+    assert trajectory.observations.shape[0] == 4
+    assert trajectory.actions.shape[0] == 3
 
 
 def test_adapter_preserves_source_episode_boundaries() -> None:

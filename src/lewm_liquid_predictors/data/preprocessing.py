@@ -13,6 +13,8 @@ from typing import cast
 import torch
 from torch import Tensor
 
+from .pusht import ObservationTrajectoryBatch
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -49,6 +51,32 @@ def resize_observations(observations: Tensor, size: int = 224) -> Tensor:
 def preprocess_observations(observations: Tensor, img_size: int = 224) -> Tensor:
     """Apply the full upstream pixel preprocessing pipeline."""
     return resize_observations(normalize_pixels(observations), img_size)
+
+
+def prepare_observation_batch(
+    batch: ObservationTrajectoryBatch,
+    action_normalizer: ZScoreNormalizer,
+    device: torch.device | str,
+    img_size: int = 224,
+) -> ObservationTrajectoryBatch:
+    """Apply shared pixel/action preprocessing and move a batch to one device."""
+    observations = channels_first(batch.observations)
+    prepared = ObservationTrajectoryBatch(
+        episode_ids=batch.episode_ids,
+        observations=preprocess_observations(observations, img_size),
+        actions=torch.nan_to_num(action_normalizer(batch.actions), 0.0),
+        transition_mask=batch.transition_mask,
+    )
+    return prepared.to(device)
+
+
+def channels_first(observations: Tensor) -> Tensor:
+    """Accept either CHW or HWC source pixels and return channels-first layout."""
+    if observations.shape[-3] == 3:
+        return observations
+    if observations.shape[-1] == 3:
+        return observations.movedim(-1, -3)
+    raise ValueError("pixels must be RGB in CHW or HWC layout")
 
 
 class ZScoreNormalizer:

@@ -25,6 +25,7 @@ class RunProvenance:
 
     created_at: str
     git_commit: str
+    git_dirty: bool
     seed: int
     requested_device: str
     device: Mapping[str, str | int | bool | None]
@@ -39,6 +40,7 @@ def capture_run_provenance(
     *,
     repo_root: str | Path | None = None,
     git_commit: str | None = None,
+    git_dirty: bool | None = None,
     packages: Mapping[str, str] | None = None,
 ) -> RunProvenance:
     """Capture versioned source, environment, and device metadata for one run."""
@@ -48,6 +50,7 @@ def capture_run_provenance(
     return RunProvenance(
         created_at=datetime.now(UTC).isoformat(),
         git_commit=_git_commit(root) if git_commit is None else git_commit,
+        git_dirty=_git_dirty(root) if git_dirty is None else git_dirty,
         seed=seed,
         requested_device=requested_device,
         device=_device_metadata(),
@@ -91,6 +94,18 @@ def _git_commit(repo_root: Path) -> str:
     ).stdout.strip()
 
 
+def _git_dirty(repo_root: Path) -> bool:
+    return bool(
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+
+
 def _device_metadata() -> dict[str, str | int | bool | None]:
     metadata: dict[str, str | int | bool | None] = {
         "cuda_available": torch.cuda.is_available(),
@@ -119,7 +134,7 @@ def _jsonable(value: Any) -> Any:
 
 def _write_json(path: Path, content: Mapping[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as file:
-        json.dump(content, file, indent=2, sort_keys=True)
+        json.dump(content, file, indent=2, sort_keys=True, allow_nan=False)
         file.write("\n")
 
 

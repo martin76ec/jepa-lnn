@@ -33,14 +33,3 @@ def test_inspect_pusht_command_prints_trajectory_shapes(
     output = capsys.readouterr().out
     assert '"observations_shape": [' in output
     assert "episode-000000" in output
-
-
-def test_retrieval_image_conversion_accepts_hwc_and_chw_pixels() -> None:
-    chw = torch.arange(3 * 2 * 4, dtype=torch.uint8).reshape(3, 2, 4)
-    hwc = chw.permute(1, 2, 0)
-
-    chw_image = cli._image_array(chw)
-    hwc_image = cli._image_array(hwc)
-
-    assert chw_image.shape == (2, 4, 3)
-    assert (chw_image == hwc_image).all()
