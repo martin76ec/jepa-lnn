@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeAlias, cast
 
 import yaml
 
 from .model import DecoderArchitecture
+
+DecoderLoss: TypeAlias = Literal["mse", "l1", "l1_lpips"]
+LPIPSNetwork: TypeAlias = Literal["alex", "vgg", "squeeze"]
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,18 @@ class DecoderTrainingSettings:
     weight_decay: float
     deterministic: bool
     use_amp: bool
+    loss: DecoderLoss
+    l1_weight: float
+    lpips_weight: float
+    lpips_network: LPIPSNetwork
+
+    def __post_init__(self) -> None:
+        if not isfinite(self.l1_weight) or not isfinite(self.lpips_weight):
+            raise ValueError("decoder loss weights must be finite")
+        if self.loss in {"l1", "l1_lpips"} and self.l1_weight <= 0:
+            raise ValueError("l1_weight must be positive when L1 loss is enabled")
+        if self.loss == "l1_lpips" and self.lpips_weight <= 0:
+            raise ValueError("lpips_weight must be positive when LPIPS loss is enabled")
 
 
 @dataclass(frozen=True)
@@ -105,6 +121,10 @@ def load_decoder_config(path: str | Path) -> DecoderConfig:
             weight_decay=_nonnegative_float(training.get("weight_decay"), "training.weight_decay"),
             deterministic=_bool(training.get("deterministic"), "training.deterministic"),
             use_amp=_bool(training.get("use_amp"), "training.use_amp"),
+            loss=_decoder_loss(training.get("loss")),
+            l1_weight=_nonnegative_float(training.get("l1_weight"), "training.l1_weight"),
+            lpips_weight=_nonnegative_float(training.get("lpips_weight"), "training.lpips_weight"),
+            lpips_network=_lpips_network(training.get("lpips_network")),
         ),
         architecture=DecoderArchitecture(
             latent_dim=_positive_int(architecture.get("latent_dim"), "architecture.latent_dim"),
@@ -146,7 +166,10 @@ def _bool(value: Any, name: str) -> bool:
 def _float(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be numeric")
-    return float(value)
+    parsed = float(value)
+    if not isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    return parsed
 
 
 def _positive_float(value: Any, name: str) -> float:
@@ -175,3 +198,17 @@ def _tuple_of_positive_ints(value: Any, name: str) -> tuple[int, ...]:
     if not isinstance(value, (list, tuple)) or not value:
         raise ValueError(f"{name} must be a non-empty sequence")
     return tuple(_positive_int(item, name) for item in value)
+
+
+def _decoder_loss(value: Any) -> DecoderLoss:
+    loss = _string(value, "training.loss")
+    if loss not in {"mse", "l1", "l1_lpips"}:
+        raise ValueError("training.loss must be one of: mse, l1, l1_lpips")
+    return cast(DecoderLoss, loss)
+
+
+def _lpips_network(value: Any) -> LPIPSNetwork:
+    network = _string(value, "training.lpips_network")
+    if network not in {"alex", "vgg", "squeeze"}:
+        raise ValueError("training.lpips_network must be one of: alex, vgg, squeeze")
+    return cast(LPIPSNetwork, network)

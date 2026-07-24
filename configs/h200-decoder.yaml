@@ -1,23 +1,27 @@
 experiment:
-  name: h200-projected-cls-decoder
+  name: h200-projected-cls-decoder-l1-lpips-v2
   seed: 7
   output_dir: runs/h200-decoder
 
 data:
   dataset: pusht_expert_train.lance
   frameskip: 5
-  fraction: 0.1
+  fraction: 1.0
   num_workers: 0
   split_manifest: runs/h200-screen/split_manifest.json
 
 training:
   device: cuda
-  epochs: 30
+  epochs: 100
   batch_size: 256
   learning_rate: 0.0001
   weight_decay: 0.0001
   deterministic: false
   use_amp: true
+  loss: l1_lpips
+  l1_weight: 1.0
+  lpips_weight: 1.0
+  lpips_network: vgg
 
 architecture:
   latent_dim: 192

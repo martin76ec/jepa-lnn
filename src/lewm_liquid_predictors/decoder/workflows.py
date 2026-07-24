@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import sys
 from collections.abc import Sequence
 from copy import deepcopy
 from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import Tensor
@@ -32,7 +34,11 @@ from lewm_liquid_predictors.models import PredictorSystem, build_predictor
 from lewm_liquid_predictors.models.checkpoint_adapters import load_official_lewm
 from lewm_liquid_predictors.models.lewm import LeWMJEPA
 from lewm_liquid_predictors.models.protocol import DynamicsPredictor
-from lewm_liquid_predictors.training import capture_run_provenance, write_metrics
+from lewm_liquid_predictors.training import (
+    build_linear_warmup_cosine_scheduler,
+    capture_run_provenance,
+    write_metrics,
+)
 from lewm_liquid_predictors.utils import ExperimentConfig, load_config
 
 from .checkpoint import (
@@ -90,8 +96,10 @@ def train_decoder(
     )
     frame_dataset = FrameDataset(trajectories)
     frames: Dataset[Tensor] = frame_dataset
+    training_frame_count = len(frame_dataset)
     if max_frames is not None:
-        frames = Subset(frame_dataset, range(min(max_frames, len(frame_dataset))))
+        training_frame_count = min(max_frames, training_frame_count)
+        frames = Subset(frame_dataset, range(training_frame_count))
 
     action_input_dim = trajectories[0].actions.shape[-1]
     official_model = load_official_lewm(official_checkpoint, action_input_dim)
@@ -102,11 +110,20 @@ def train_decoder(
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
+    steps_per_epoch = math.ceil(training_frame_count / config.training.batch_size)
+    total_steps = config.training.epochs * steps_per_epoch
+    warmup_steps = max(1, int(0.01 * total_steps)) if total_steps > 1 else 0
+    scheduler = build_linear_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps)
     trainer = DecoderTrainer(
         encoder,
         decoder,
         optimizer,
         use_amp=config.training.use_amp,
+        loss=config.training.loss,
+        l1_weight=config.training.l1_weight,
+        lpips_weight=config.training.lpips_weight,
+        lpips_network=config.training.lpips_network,
+        scheduler=scheduler,
     )
     provenance = capture_run_provenance(
         seed=config.experiment.seed,
@@ -114,7 +131,10 @@ def train_decoder(
     )
     run_dir = initialize_decoder_run(config, provenance)
     shutil.copyfile(config.data.split_manifest, run_dir / "split_manifest.json")
-    write_source_checkpoints(run_dir, [official_checkpoint])
+    source_checkpoints = [Path(official_checkpoint)]
+    if config.training.loss == "l1_lpips":
+        source_checkpoints.append(_torchvision_backbone_checkpoint(config.training.lpips_network))
+    write_source_checkpoints(run_dir, source_checkpoints)
 
     history: list[dict[str, float]] = []
     epochs = tqdm(range(config.training.epochs), desc="decoder epochs", file=sys.stderr)
@@ -130,14 +150,23 @@ def train_decoder(
             drop_last=False,
         )
         metrics = trainer.train_epoch(loader)
+        learning_rate = optimizer.param_groups[0]["lr"]
         history.append(
             {
                 "epoch": float(epoch + 1),
+                "train/loss": metrics.total_loss,
                 "train/mse": metrics.mean_squared_error,
+                "train/l1": metrics.mean_absolute_error,
+                "train/lpips": metrics.lpips_loss,
                 "train/frames": float(metrics.frames),
+                "train/lr": learning_rate,
             }
         )
-        epochs.set_postfix(mse=f"{metrics.mean_squared_error:.5f}")
+        epochs.set_postfix(
+            loss=f"{metrics.total_loss:.5f}",
+            l1=f"{metrics.mean_absolute_error:.5f}",
+            lpips=f"{metrics.lpips_loss:.5f}",
+        )
 
     (run_dir / "history.json").write_text(
         json.dumps(history, indent=2, allow_nan=False) + "\n",
@@ -334,6 +363,28 @@ def _resolve_decoder_checkpoint(
     if not candidates:
         raise FileNotFoundError(f"no decoder checkpoint found under {config.experiment.output_dir}")
     return candidates[-1]
+
+
+def _torchvision_backbone_checkpoint(network: str) -> Path:
+    from urllib.parse import urlparse
+
+    models: Any = import_module("torchvision.models")
+
+    weights_by_network = {
+        "alex": models.AlexNet_Weights.IMAGENET1K_V1,
+        "vgg": models.VGG16_Weights.IMAGENET1K_V1,
+        "squeeze": models.SqueezeNet1_1_Weights.IMAGENET1K_V1,
+    }
+    weights = weights_by_network.get(network)
+    if weights is None:
+        raise ValueError(f"unsupported LPIPS network: {network}")
+    filename = Path(urlparse(weights.url).path).name
+    checkpoint = Path(torch.hub.get_dir()) / "checkpoints" / filename
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            f"LPIPS backbone checkpoint was not cached after initialization: {checkpoint}"
+        )
+    return checkpoint
 
 
 def _resolve_device(requested: str) -> torch.device:
