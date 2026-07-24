@@ -29,6 +29,10 @@ from lewm_liquid_predictors.data import (
 )
 from lewm_liquid_predictors.data.preprocessing import ZScoreNormalizer
 from lewm_liquid_predictors.data.pusht import EpisodeSource
+from lewm_liquid_predictors.decoder import (
+    render_decoder_galleries,
+    train_decoder,
+)
 from lewm_liquid_predictors.evaluation import (
     EpisodePredictions,
     HeldOutEvaluation,
@@ -109,6 +113,28 @@ def main(arguments: Sequence[str] | None = None) -> int:
     )
     evaluate_lewm.add_argument("--max-test-episodes", type=int, default=None)
 
+    train_decoder_parser = subparsers.add_parser("train-decoder")
+    train_decoder_parser.add_argument("config", type=Path)
+    train_decoder_parser.add_argument("--data-path", default="data/raw/pusht_expert_train.lance")
+    train_decoder_parser.add_argument(
+        "--checkpoint", type=Path, default=Path("checkpoints/lewm-pusht/weights.pt")
+    )
+    train_decoder_parser.add_argument("--max-train-episodes", type=int, default=None)
+    train_decoder_parser.add_argument("--max-frames", type=int, default=None)
+
+    render_decoder_parser = subparsers.add_parser("render-decoder-galleries")
+    render_decoder_parser.add_argument("config", type=Path)
+    render_decoder_parser.add_argument("--data-path", default="data/raw/pusht_expert_train.lance")
+    render_decoder_parser.add_argument(
+        "--checkpoint", type=Path, default=Path("checkpoints/lewm-pusht/weights.pt")
+    )
+    render_decoder_parser.add_argument(
+        "--predictor-root", type=Path, default=Path("runs/h200-screen")
+    )
+    render_decoder_parser.add_argument("--decoder-checkpoint", type=Path, default=None)
+    render_decoder_parser.add_argument("--max-predictor-runs", type=int, default=None)
+    render_decoder_parser.add_argument("--max-gallery-episodes", type=int, default=None)
+
     parsed = parser.parse_args(arguments)
     if parsed.command == "validate-config":
         config = load_config(parsed.config)
@@ -140,6 +166,28 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _run_screen(parsed)
     if parsed.command == "evaluate-lewm-official":
         return _run_evaluate_lewm_official(parsed)
+    if parsed.command == "train-decoder":
+        run_dir = train_decoder(
+            parsed.config,
+            parsed.data_path,
+            parsed.checkpoint,
+            max_train_episodes=parsed.max_train_episodes,
+            max_frames=parsed.max_frames,
+        )
+        print(json.dumps({"decoder_run": str(run_dir)}, sort_keys=True))
+        return 0
+    if parsed.command == "render-decoder-galleries":
+        output_dir = render_decoder_galleries(
+            parsed.config,
+            parsed.data_path,
+            parsed.checkpoint,
+            parsed.predictor_root,
+            decoder_checkpoint=parsed.decoder_checkpoint,
+            max_predictor_runs=parsed.max_predictor_runs,
+            max_gallery_episodes=parsed.max_gallery_episodes,
+        )
+        print(json.dumps({"decoded_galleries": str(output_dir)}, sort_keys=True))
+        return 0
     return 1
 
 

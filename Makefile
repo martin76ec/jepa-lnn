@@ -7,12 +7,15 @@ H200_CONFIG := configs/h200.yaml
 H200_PILOT_CONFIG := configs/h200-pilot.yaml
 H200_SCREEN_CONFIG := configs/h200-screen.yaml
 LEWM_OFFICIAL_CONFIG := configs/h200-lewm-official.yaml
+H200_DECODER_CONFIG := configs/h200-decoder.yaml
 LEWM_MODEL_REPOSITORY := quentinll/lewm-pusht
 LEWM_MODEL_REVISION := 22b330c28c27ead4bfd1888615af1340e3fe9052
 LEWM_CHECKPOINT_DIRECTORY := checkpoints/lewm-pusht
+LEWM_CONFIG_SHA256 := 2564086e961e7b5c7c04dffc451091115b389a590645ff19653c64fd0bc16e09
+LEWM_WEIGHTS_SHA256 := 48938400ae3464c9680731287f583a9cb516f55a8ec64ea13a91be47fb15b607
 
 .DEFAULT_GOAL := help
-.PHONY: help sync download-data download-lewm-checkpoint inspect-data validate-local validate-h200 validate-h200-pilot validate-h200-screen format lint typecheck test check train-local evaluate-local train-lewm-local train-lewm-h200 train-lewm-h200-pilot train-h200-screen evaluate-lewm-official clean
+.PHONY: help sync download-data download-lewm-checkpoint inspect-data validate-local validate-h200 validate-h200-pilot validate-h200-screen format lint typecheck test check train-local evaluate-local train-lewm-local train-lewm-h200 train-lewm-h200-pilot train-h200-screen evaluate-lewm-official train-h200-decoder render-h200-decoder-galleries clean
 
 help:
 	@printf '%s\n' \
@@ -32,6 +35,8 @@ help:
 		'  train-lewm-h200-pilot Run the 10%-data, 10-epoch H200 pilot (not a baseline result).' \
 		'  train-h200-screen Run the three-seed, five-predictor H200 screening study.' \
 		'  evaluate-lewm-official Evaluate the official full LeWM-JEPA checkpoint.' \
+		'  train-h200-decoder Train only the post-hoc projected-CLS image decoder.' \
+		'  render-h200-decoder-galleries Decode all saved predictor checkpoints without retraining.' \
 		'  format         Format the repository with Ruff.' \
 		'  lint           Run Ruff lint checks.' \
 		'  typecheck      Run strict mypy checks.' \
@@ -46,9 +51,8 @@ download-data:
 	$(UV) run --group data hf download $(DATASET_REPOSITORY) --repo-type dataset --local-dir $(DATASET_DIRECTORY) --include "$(DATASET_NAME)/**"
 
 download-lewm-checkpoint:
-	mkdir -p $(LEWM_CHECKPOINT_DIRECTORY)
-	curl -L --fail --continue-at - --output $(LEWM_CHECKPOINT_DIRECTORY)/config.json https://huggingface.co/$(LEWM_MODEL_REPOSITORY)/resolve/$(LEWM_MODEL_REVISION)/config.json
-	curl -L --fail --continue-at - --output $(LEWM_CHECKPOINT_DIRECTORY)/weights.pt https://huggingface.co/$(LEWM_MODEL_REPOSITORY)/resolve/$(LEWM_MODEL_REVISION)/weights.pt
+	$(UV) run python -m lewm_liquid_predictors.artifacts https://huggingface.co/$(LEWM_MODEL_REPOSITORY)/resolve/$(LEWM_MODEL_REVISION)/config.json $(LEWM_CHECKPOINT_DIRECTORY)/config.json $(LEWM_CONFIG_SHA256)
+	$(UV) run python -m lewm_liquid_predictors.artifacts https://huggingface.co/$(LEWM_MODEL_REPOSITORY)/resolve/$(LEWM_MODEL_REVISION)/weights.pt $(LEWM_CHECKPOINT_DIRECTORY)/weights.pt $(LEWM_WEIGHTS_SHA256)
 
 inspect-data:
 	$(UV) run --extra upstream lewm-liquid-predictors inspect-pusht $(DATASET_DIRECTORY)/$(DATASET_NAME) --max-episodes 1
@@ -85,6 +89,12 @@ train-h200-screen:
 
 evaluate-lewm-official:
 	STABLEWM_HOME=$(CURDIR)/data/raw HF_HUB_OFFLINE=1 $(UV) run --extra upstream lewm-liquid-predictors evaluate-lewm-official $(LEWM_OFFICIAL_CONFIG) --checkpoint $(LEWM_CHECKPOINT_DIRECTORY)/weights.pt
+
+train-h200-decoder:
+	STABLEWM_HOME=$(CURDIR)/data/raw HF_HUB_OFFLINE=1 $(UV) run --extra upstream lewm-liquid-predictors train-decoder $(H200_DECODER_CONFIG) --checkpoint $(LEWM_CHECKPOINT_DIRECTORY)/weights.pt
+
+render-h200-decoder-galleries:
+	STABLEWM_HOME=$(CURDIR)/data/raw HF_HUB_OFFLINE=1 $(UV) run --extra upstream lewm-liquid-predictors render-decoder-galleries $(H200_DECODER_CONFIG) --checkpoint $(LEWM_CHECKPOINT_DIRECTORY)/weights.pt --predictor-root runs/h200-screen
 
 format:
 	$(UV) run ruff format .

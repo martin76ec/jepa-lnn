@@ -33,3 +33,57 @@ def test_inspect_pusht_command_prints_trajectory_shapes(
     output = capsys.readouterr().out
     assert '"observations_shape": [' in output
     assert "episode-000000" in output
+
+
+def test_train_decoder_command_delegates_without_predictor_training(
+    tmp_path: Path,
+    monkeypatch: object,
+    capsys: object,
+) -> None:
+    run_dir = tmp_path / "decoder-run"
+    calls: list[tuple[object, ...]] = []
+
+    def fake_train(*args: object, **kwargs: object) -> Path:
+        calls.append((*args, kwargs))
+        return run_dir
+
+    monkeypatch.setattr(cli, "train_decoder", fake_train)  # type: ignore[attr-defined]
+
+    assert cli.main(["train-decoder", "decoder.yaml", "--max-frames", "4"]) == 0
+
+    assert calls
+    assert '"decoder_run"' in capsys.readouterr().out
+
+
+def test_render_decoder_command_delegates_to_existing_predictor_root(
+    tmp_path: Path,
+    monkeypatch: object,
+    capsys: object,
+) -> None:
+    output_dir = tmp_path / "galleries"
+    calls: list[tuple[object, ...]] = []
+
+    def fake_render(*args: object, **kwargs: object) -> Path:
+        calls.append((*args, kwargs))
+        return output_dir
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        cli, "render_decoder_galleries", fake_render
+    )
+
+    assert (
+        cli.main(
+            [
+                "render-decoder-galleries",
+                "decoder.yaml",
+                "--predictor-root",
+                "runs/h200-screen",
+                "--max-predictor-runs",
+                "1",
+            ]
+        )
+        == 0
+    )
+
+    assert calls
+    assert '"decoded_galleries"' in capsys.readouterr().out

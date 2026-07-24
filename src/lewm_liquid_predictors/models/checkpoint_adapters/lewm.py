@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +10,7 @@ from typing import cast
 import torch
 from torch import Tensor
 
+from ...artifacts import file_sha256
 from ..lewm import LeWMJEPA, build_lewm_baseline
 
 
@@ -110,12 +110,3 @@ def convert_official_encoder_key(key: str) -> str:
     converted = converted.replace(".intermediate.dense.", ".mlp.fc1.")
     converted = converted.replace(".output.dense.", ".mlp.fc2.")
     return f"encoder.encoder.{converted}"
-
-
-def file_sha256(path: str | Path) -> str:
-    """Return a file digest without loading the checkpoint into memory."""
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
